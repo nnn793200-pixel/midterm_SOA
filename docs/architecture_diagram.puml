@@ -1,0 +1,160 @@
+@startuml architecture_diagram
+' ============================================================================
+' Môn học : Kiến Trúc Hướng Dịch Vụ (504070) - HK1/2026-2027 - ĐH Tôn Đức Thắng
+' Dự án   : Phân hệ đóng học phí của ứng dụng iBanking
+' Nhóm SV : 1. Trần Minh Nghĩa      - MSSV: 524K0032
+'           2. Huỳnh Trung Tín      - MSSV: 524K0033
+'           3. Phan Nguyễn Thảo Như - MSSV: 524V0007
+' ============================================================================
+!theme plain
+top to bottom direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+
+header Nhóm thực hiện: Trần Minh Nghĩa (524K0032) | Huỳnh Trung Tín (524K0033) | Phan Nguyễn Thảo Như (524V0007)
+title SƠ ĐỒ KIẾN TRÚC MICROSERVICES (MICROSERVICES ARCHITECTURE DIAGRAM)\nPHÂN HỆ ĐÓNG HỌC PHÍ CỦA ỨNG DỤNG iBANKING (TDTU)
+
+' ==========================================
+' 1. CLIENT LAYER
+' ==========================================
+package "Client Layer (Presentation Tier)" #F8FAFC {
+    component "iBanking Web Application\n(React 18 + Vite + Tailwind CSS)\n[Port: 5173 / 3000]" as WebUI <<SPA Frontend>> {
+        [1. Màn hình Đăng nhập]
+        [2. Màn hình Thanh toán Học phí\n(3 nhóm: Người nộp, Học phí, Thanh toán)]
+        [3. Modal Xác thực OTP (Đếm ngược 05:00)]
+        [4. Màn hình Kết quả & Lịch sử Giao dịch]
+    }
+}
+
+' ==========================================
+' 2. API GATEWAY LAYER
+' ==========================================
+package "API Gateway Layer (Single Entry Point)" #EFF6FF {
+    component "API Gateway Service\n(FastAPI Reverse Proxy)\n[Port: 8000]" as Gateway <<API Gateway>> {
+        [JWT Authentication Filter]
+        [Correlation-ID Middleware (X-Request-ID)]
+        [Request Routing & Error Normalization]
+    }
+}
+
+' ==========================================
+' 3. MICROSERVICES LAYER (CORE BUSINESS)
+' ==========================================
+package "Core Microservices Layer (Python FastAPI - Docker Network)" #F0FDF4 {
+
+    component "auth-account-service\n[Port: 8001]" as AuthService <<Microservice>> {
+        [Xác thực Username/Password & Cấp JWT]
+        [Truy vấn Thông tin Người nộp & Số dư]
+        [Internal API: Trừ tiền Atomic (SELECT FOR UPDATE)]
+        [Internal API: Hoàn tiền bù trừ (Saga Refund)]
+    }
+
+    component "tuition-service\n[Port: 8002]" as TuitionService <<Microservice>> {
+        [Tra cứu Sinh viên TDTU & Công nợ theo MSSV]
+        [Internal API: Kiểm tra trạng thái UNPAID]
+        [Internal API: Gạch nợ Atomic (SELECT FOR UPDATE\n& UPDATE status='PAID' WHERE status='UNPAID')]
+    }
+
+    component "payment-service\n[Port: 8003]" as PaymentService <<Saga Orchestrator>> {
+        [Khởi tạo Giao dịch (Pre-check, KHÔNG giữ Row Lock)]
+        [Kiểm soát Idempotency-Key (Chống Double-Submit)]
+        [Điều phối Xác thực OTP & Thực thi Saga]
+        [Kích hoạt Compensating Refund khi đụng độ Concurrency]
+        [Truy vấn Lịch sử Giao dịch Người dùng]
+    }
+
+    component "notification-otp-service\n[Port: 8004]" as NotificationService <<Microservice>> {
+        [Sinh OTP 6 số duy nhất gắn với transaction_id]
+        [Đảm bảo không trùng OTP đang active (Redis SET NX)]
+        [Xác thực & Tiêu hủy OTP 1 lần (Lua Atomic Script)]
+        [Gửi Email OTP & Email Biên lai xác nhận (SMTP)]
+    }
+}
+
+' ==========================================
+' 4. DATA PERSISTENCE & CACHE LAYER
+' ==========================================
+package "Data Persistence Layer (Database-per-Service Pattern)" #FEFCE8 {
+
+    database "account_db\n(PostgreSQL 16)\n[Port: 5432]" as AccountDB {
+        [users_accounts\n(CHECK available_balance >= 0)]
+        [account_ledger_entries]
+    }
+
+    database "tuition_db\n(PostgreSQL 16)\n[Port: 5432]" as TuitionDB {
+        [students (MSSV)]
+        [tuition_bills\n(status: UNPAID | PAID)]
+    }
+
+    database "payment_db\n(PostgreSQL 16)\n[Port: 5432]" as PaymentDB {
+        [payment_transactions]
+        [saga_step_logs]
+        [idempotency_records]
+    }
+
+    database "notification_db\n(PostgreSQL 16)\n[Port: 5432]" as NotificationDB {
+        [otp_tokens (Audit & Persistence)]
+        [notification_logs]
+    }
+
+    database "Redis 7 In-Memory Store\n[Port: 6379]" as RedisStore {
+        [otp:tx:{tx_id} (TTL = 300s / 5 phút)]
+        [otp:active_code:{code} (TTL = 300s, Chống trùng)]
+        [lock:tuition:{mssv} (Distributed Guard)]
+    }
+}
+
+' ==========================================
+' 5. EXTERNAL SERVICE LAYER
+' ==========================================
+package "External Infrastructure Layer" #FFF1F2 {
+    component "Mailpit SMTP & Web Inbox Server\n[SMTP Port: 1025 | Web UI Port: 8025]" as Mailpit <<External Mail Server>>
+}
+
+' ==========================================
+' CONNECTIONS & PROTOCOLS
+' ==========================================
+WebUI -down-> Gateway : "HTTPS / REST JSON\nAuthorization: Bearer <JWT>\nIdempotency-Key: <UUID>\nX-Request-ID: <UUID>"
+
+Gateway -down-> AuthService : "REST /api/v1/auth/*\n/api/v1/accounts/*\n(Forward X-Request-ID)"
+Gateway -down-> TuitionService : "REST /api/v1/tuitions/{mssv}\n(Forward X-Request-ID, X-User-ID)"
+Gateway -down-> PaymentService : "REST /api/v1/payments/*\n(Forward X-Request-ID, X-User-ID)"
+
+' Internal Service-to-Service Communication (Orchestrated by Payment Service)
+PaymentService -left-> AuthService : "Internal REST (Synchronous)\n1. GET /internal/accounts/{id}\n2. POST /internal/accounts/debit\n3. POST /internal/accounts/refund (Saga Compensation)"
+PaymentService -up-> TuitionService : "Internal REST (Synchronous)\n1. GET /internal/tuitions/{mssv}\n2. POST /internal/tuitions/mark-paid"
+PaymentService -right-> NotificationService : "Internal REST (Synchronous)\n1. POST /internal/otp/generate\n2. POST /internal/otp/verify\n3. POST /internal/notifications/payment-receipt"
+
+' Database Connections (Strict Data Ownership)
+AuthService -down-> AccountDB : "SQLAlchemy / psycopg2\n(Pessimistic Lock: FOR UPDATE)"
+TuitionService -down-> TuitionDB : "SQLAlchemy / psycopg2\n(Pessimistic Lock: FOR UPDATE)"
+PaymentService -down-> PaymentDB : "SQLAlchemy / psycopg2"
+PaymentService -down-> RedisStore : "Redis Client\n(Idempotency & Distributed Lock)"
+NotificationService -down-> NotificationDB : "SQLAlchemy / psycopg2\n(Persist otp_tokens & notification_logs)"
+NotificationService -down-> RedisStore : "Redis Lua Script\n(Atomic OTP TTL 300s & One-time Verify)"
+
+' External SMTP Connection
+NotificationService -down-> Mailpit : "SMTP Protocol (Port 1025)\nSend HTML OTP Email & Receipt Email"
+
+note right of Gateway
+  **Trách nhiệm của API Gateway:**
+  1. Điểm truy cập duy nhất cho Frontend.
+  2. Tự động gắn `X-Request-ID` (Correlation-ID) để tracing xuyên suốt 4 services.
+  3. Xác thực JWT Token tập trung và trích xuất `X-User-ID`, `X-Username`.
+end note
+
+note bottom of PaymentService
+  **Lý do chọn Saga Pattern (Orchestration):**
+  - Mỗi Microservice sở hữu Database độc lập (`account_db`, `tuition_db`, `payment_db`, `notification_db`).
+  - Không dùng 2PC (Two-Phase Commit) xuyên service để tránh giữ khóa lâu.
+  - Không giữ Row Lock trong 5 phút chờ nhập OTP.
+  - Khi xác thực OTP xong, `payment-service` điều phối tuần tự:
+    `Verify OTP -> Debit Account -> Mark Tuition PAID -> Send Receipt`.
+  - Nếu bước `Mark Tuition PAID` báo `409 Conflict` (do người khác vừa đóng xong),
+    `payment-service` lập tức gọi `POST /internal/accounts/refund` để hoàn tiền.
+end note
+
+@enduml

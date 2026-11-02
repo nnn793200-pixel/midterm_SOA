@@ -1,0 +1,161 @@
+@startuml sequence_diagram
+' ============================================================================
+' Môn học : Kiến Trúc Hướng Dịch Vụ (504070) - HK1/2026-2027 - ĐH Tôn Đức Thắng
+' Dự án   : Phân hệ đóng học phí của ứng dụng iBanking
+' Nhóm SV : 1. Trần Minh Nghĩa      - MSSV: 524K0032
+'           2. Huỳnh Trung Tín      - MSSV: 524K0033
+'           3. Phan Nguyễn Thảo Như - MSSV: 524V0007
+' ============================================================================
+!theme plain
+autonumber "<b>[00]"
+skinparam shadowing false
+skinparam roundcorner 6
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 220
+
+header Nhóm thực hiện: Trần Minh Nghĩa (524K0032) | Huỳnh Trung Tín (524K0033) | Phan Nguyễn Thảo Như (524V0007)
+title SƠ ĐỒ TUẦN TỰ (SEQUENCE DIAGRAM)\nLUỒNG THANH TOÁN HỌC PHÍ, XÁC THỰC OTP, XỬ LÝ CONCURRENCY & SAGA COMPENSATION
+
+actor "Người nộp tiền\n(iBanking Web UI)" as User
+participant "API Gateway\n(:8000)" as Gateway
+participant "auth-account-service\n(:8001 + account_db)" as AuthSvc
+participant "tuition-service\n(:8002 + tuition_db)" as TuitionSvc
+participant "payment-service\n(:8003 + payment_db)\n[Saga Orchestrator]" as PaymentSvc
+participant "notification-otp-service\n(:8004 + notification_db)" as OtpSvc
+database "Redis 7\n(OTP TTL 300s & Lock)" as Redis
+participant "Mailpit SMTP\n(:1025 / :8025)" as SMTP
+
+' ==============================================================================
+' GIAI ĐOẠN 1: ĐĂNG NHẬP & TRA CỨU HỌC PHÍ
+' ==============================================================================
+== Giai đoạn 1: Đăng nhập, Lấy thông tin Người nộp tiền & Tự động tra cứu Học phí ==
+
+User -> Gateway : POST /api/v1/auth/login (username, password)
+Gateway -> AuthSvc : POST /auth/login (X-Request-ID)
+AuthSvc -> AuthSvc : Kiểm tra bcrypt password_hash\n& tạo JWT Access Token
+AuthSvc --> Gateway : 200 OK (access_token, user_profile)
+Gateway --> User : 200 OK (JWT + Họ tên, SĐT, Email, Số dư khả dụng)
+
+User -> Gateway : Nhập MSSV -> GET /api/v1/tuitions/{mssv}\n(Authorization: Bearer <JWT>)
+Gateway -> TuitionSvc : GET /tuitions/{mssv} (X-Request-ID, X-User-ID)
+TuitionSvc -> TuitionSvc : SELECT * FROM students JOIN tuition_bills\nWHERE student_id = :mssv
+TuitionSvc --> Gateway : 200 OK (MSSV, Họ tên SV, Học kỳ, Số tiền, status='UNPAID')
+Gateway --> User : Hiển thị Họ tên SV & Số tiền học phí\n(Bật nút "Xác nhận giao dịch" khi UNPAID, Số dư >= Học phí & Tick điều khoản)
+
+' ==============================================================================
+' GIAI ĐOẠN 2: KHỞI TẠO GIAO DỊCH & SINH OTP (PRE-CHECK, KHÔNG GIỮ ROW LOCK)
+' ==============================================================================
+== Giai đoạn 2: Khởi tạo Giao dịch (Pre-check điều kiện, KHÔNG giữ DB Row Lock trong 5 phút chờ OTP) ==
+
+User -> Gateway : Nhấn "Xác nhận giao dịch"\nPOST /api/v1/payments/initiate\n(Headers: Authorization, Idempotency-Key)\nBody: { student_id, tuition_bill_id, terms_accepted: true }
+Gateway -> PaymentSvc : POST /payments/initiate (X-Request-ID, X-User-ID, Idempotency-Key)
+
+PaymentSvc -> PaymentSvc : Kiểm tra bảng idempotency_records\n(Nếu trùng key -> Trả về kết quả đã cache)
+
+PaymentSvc -> AuthSvc : GET /internal/accounts/{payer_id}\n(Pre-check thông tin người nộp & số dư hiện tại)
+AuthSvc --> PaymentSvc : 200 OK (available_balance, email, full_name, phone)
+
+PaymentSvc -> TuitionSvc : GET /internal/tuitions/{mssv}\n(Pre-check học phí tồn tại & status == 'UNPAID')
+TuitionSvc --> PaymentSvc : 200 OK (tuition_bill_id, amount, status='UNPAID')
+
+note over PaymentSvc, TuitionSvc #FFFBEB
+  **Lưu ý Kỹ thuật Quan trọng (Không giữ Lock khi chờ OTP):**
+  Ở bước khởi tạo, hệ thống chỉ đọc kiểm tra điều kiện ban đầu (`status == 'UNPAID'`
+  và `available_balance >= amount`). **TUYỆT ĐỐI KHÔNG** dùng `SELECT ... FOR UPDATE`
+  giữ khóa dòng trong suốt 5 phút chờ người dùng nhập OTP!
+end note
+
+PaymentSvc -> PaymentSvc : INSERT INTO payment_transactions\n(status = 'PENDING_OTP', amount = full_tuition_amount,\notp_expires_at = NOW() + 5 minutes)
+
+PaymentSvc -> OtpSvc : POST /internal/otp/generate\n{ transaction_id, recipient_email, student_id, amount }
+
+loop Sinh mã OTP 6 chữ số không trùng với bất kỳ OTP nào đang active
+    OtpSvc -> Redis : SET otp:active_code:{otp_code} {transaction_id} NX EX 300
+end
+OtpSvc -> Redis : SET otp:tx:{transaction_id} JSON(otp_code, expires_at, is_used=false) EX 300
+OtpSvc -> OtpSvc : INSERT INTO otp_tokens (transaction_id, otp_code, is_used=FALSE, expires_at=NOW()+5m)
+OtpSvc -> SMTP : Gửi Email chứa mã OTP (Hiệu lực 5 phút) tới Email người nộp tiền
+SMTP --> OtpSvc : 250 OK (Queued)
+OtpSvc -> OtpSvc : INSERT INTO notification_logs (type='OTP_EMAIL', status='SENT')
+OtpSvc --> PaymentSvc : 201 Created (otp_expires_at, masked_email)
+
+PaymentSvc --> Gateway : 201 Created { transaction_id, status: 'PENDING_OTP', expires_in: 300 }
+Gateway --> User : Hiển thị Modal nhập OTP (Đếm ngược 05:00)
+
+' ==============================================================================
+' GIAI ĐOẠN 3: XÁC THỰC OTP & THỰC THI SAGA + XỬ LÝ CONCURRENCY
+' ==============================================================================
+== Giai đoạn 3: Xác thực OTP (One-Time Use) & Thực thi Saga với Pessimistic Locking Tức Thời ==
+
+User -> Gateway : Nhập OTP & Nhấn "Xác nhận thanh toán"\nPOST /api/v1/payments/{transaction_id}/confirm-otp\n(Headers: Authorization, Idempotency-Key) { otp_code }
+Gateway -> PaymentSvc : POST /payments/{transaction_id}/confirm-otp
+
+PaymentSvc -> PaymentSvc : SELECT * FROM payment_transactions WHERE id = :tx_id FOR UPDATE\n(Đảm bảo giao dịch đang ở trạng thái PENDING_OTP & chưa hết hạn)
+
+PaymentSvc -> OtpSvc : POST /internal/otp/verify { transaction_id, otp_code }
+OtpSvc -> Redis : Thực thi **Redis Lua Script Nguyên Tử (Atomic)**:\n1. Kiểm tra `otp:tx:{tx_id}` tồn tại (chưa quá 5 phút)\n2. Kiểm tra `otp_code` khớp & `is_used == false`\n3. Đánh dấu `is_used = true` & Xóa `otp:active_code:{otp_code}`
+Redis --> OtpSvc : OK (Valid & Consumed One-Time)
+OtpSvc -> OtpSvc : UPDATE otp_tokens SET is_used = TRUE, used_at = NOW()\nWHERE transaction_id = :tx_id AND is_used = FALSE
+OtpSvc --> PaymentSvc : 200 OK (OTP Verified)
+
+' --- BƯỚC SAGA 1: TRỪ TIỀN TÀI KHOẢN (XỬ LÝ CONCURRENCY 1) ---
+group Bước Saga 1: Kiểm tra lại số dư & Trừ tiền Nguyên tử (Chống Concurrency 1 - Nhiều GD trên 1 Tài khoản)
+    PaymentSvc -> AuthSvc : POST /internal/accounts/debit\n{ account_id, transaction_id, amount, idempotency_key }
+    AuthSvc -> AuthSvc : **BEGIN DB TRANSACTION;**\n**SELECT * FROM users_accounts WHERE id = :account_id FOR UPDATE;**\n(Khóa Pessimistic ngay lúc thực thi - serialize mọi GD đồng thời trên cùng tài khoản)
+
+    alt Số dư khả dụng hiện tại >= Số tiền học phí (Hợp lệ)
+        AuthSvc -> AuthSvc : UPDATE users_accounts\nSET available_balance = available_balance - :amount, version = version + 1\nWHERE id = :account_id AND available_balance >= :amount;\nINSERT INTO account_ledger_entries (entry_type='DEBIT', ...);\n**COMMIT;**
+        AuthSvc --> PaymentSvc : 200 OK (new_balance, ledger_entry_id)
+    else Concurrency 1 xảy ra: Giao dịch khác trên cùng tài khoản vừa trừ hết số dư (available_balance < amount)
+        AuthSvc -> AuthSvc : **ROLLBACK;**
+        AuthSvc --> PaymentSvc : 409 Conflict (Error: INSUFFICIENT_BALANCE)
+        PaymentSvc -> PaymentSvc : UPDATE payment_transactions SET status = 'FAILED',\nfailure_reason = 'Số dư khả dụng không đủ tại thời điểm thanh toán'
+        PaymentSvc --> Gateway : 409 Conflict (Không bị chi tiêu vượt số dư)
+    end
+end
+
+' --- BƯỚC SAGA 2: GẠCH NỢ HỌC PHÍ (XỬ LÝ CONCURRENCY 2 + SAGA COMPENSATION) ---
+group Bước Saga 2: Khóa & Gạch nợ Học phí (Chống Concurrency 2 - Nhiều Tài khoản cùng đóng 1 MSSV)
+    PaymentSvc -> TuitionSvc : POST /internal/tuitions/mark-paid\n{ tuition_bill_id, student_id, transaction_id, payer_account_id, amount }
+    TuitionSvc -> TuitionSvc : **BEGIN DB TRANSACTION;**\n**SELECT * FROM tuition_bills WHERE id = :bill_id FOR UPDATE;**\n(Khóa dòng học phí của MSSV)
+
+    alt Trường hợp 2A (Happy Path): Học phí vẫn đang là 'UNPAID' (Giao dịch về đích đầu tiên)
+        TuitionSvc -> TuitionSvc : UPDATE tuition_bills\nSET status = 'PAID', paid_transaction_id = :tx_id,\npaid_by_account_id = :payer_id, paid_at = NOW(), version = version + 1\nWHERE id = :bill_id AND status = 'UNPAID';\n**COMMIT;**
+        TuitionSvc --> PaymentSvc : 200 OK (status='PAID', paid_at)
+
+        PaymentSvc -> PaymentSvc : UPDATE payment_transactions\nSET status = 'COMPLETED', completed_at = NOW();\nINSERT INTO saga_step_logs (step='MARK_TUITION_PAID', status='SUCCESS')
+
+        PaymentSvc -> OtpSvc : POST /internal/notifications/payment-receipt\n{ transaction_id, recipient_email, payer_name, student_id, student_name, amount, paid_at }
+        OtpSvc -> SMTP : Gửi Email Xác nhận Giao dịch Thành công (Biên lai điện tử)
+        SMTP --> OtpSvc : 250 OK
+        OtpSvc -> OtpSvc : INSERT INTO notification_logs (type='PAYMENT_RECEIPT_EMAIL', status='SENT')
+        OtpSvc --> PaymentSvc : 200 OK
+
+        PaymentSvc --> Gateway : 200 OK { status: 'COMPLETED', receipt_data }
+        Gateway --> User : Hiển thị Màn hình Biên lai Thành công & Cập nhật Lịch sử GD
+
+    else Trường hợp 2B (Concurrency 2): Tài khoản khác vừa thanh toán xong cho MSSV này (status == 'PAID')
+        TuitionSvc -> TuitionSvc : **ROLLBACK;**
+        TuitionSvc --> PaymentSvc : 409 Conflict (Error: TUITION_ALREADY_PAID)
+
+        note over PaymentSvc, AuthSvc #FEE2E2
+          **KÍCH HOẠT SAGA COMPENSATING TRANSACTION (HOÀN TIỀN TỨC THỜI):**
+          Vì Khoản học phí đã được người khác thanh toán trước vài mili-giây,
+          `payment-service` lập tức gọi bù trừ hoàn lại đúng số tiền vừa trừ cho người nộp.
+        end note
+
+        PaymentSvc -> AuthSvc : POST /internal/accounts/refund\n{ account_id, transaction_id, amount, reason: 'SAGA_COMPENSATION_TUITION_ALREADY_PAID' }
+        AuthSvc -> AuthSvc : **BEGIN DB TRANSACTION;**\nSELECT * FROM users_accounts WHERE id = :account_id FOR UPDATE;\nUPDATE users_accounts SET available_balance = available_balance + :amount, version = version + 1;\nINSERT INTO account_ledger_entries (entry_type='COMPENSATION_REFUND', ...);\n**COMMIT;**
+        AuthSvc --> PaymentSvc : 200 OK (Refunded, restored_balance)
+
+        PaymentSvc -> PaymentSvc : UPDATE payment_transactions\nSET status = 'COMPENSATED',\nfailure_reason = 'Khoản học phí đã được thanh toán bởi một giao dịch khác. Hệ thống đã hoàn tiền vào tài khoản.';\nINSERT INTO saga_step_logs (step='COMPENSATE_REFUND', status='COMPENSATED')
+
+        PaymentSvc --> Gateway : 409 Conflict { status: 'COMPENSATED', message: 'Học phí đã được đóng bởi tài khoản khác. Số dư của bạn đã được hoàn trả nguyên vẹn.' }
+        Gateway --> User : Thông báo từ chối giao dịch trùng & Xác nhận số dư không bị trừ
+    end
+end
+
+@enduml

@@ -1,0 +1,119 @@
+@startuml use_case_diagram
+' ============================================================================
+' Môn học : Kiến Trúc Hướng Dịch Vụ (504070) - HK1/2026-2027 - ĐH Tôn Đức Thắng
+' Dự án   : Phân hệ đóng học phí của ứng dụng iBanking
+' Nhóm SV : 1. Trần Minh Nghĩa      - MSSV: 524K0032
+'           2. Huỳnh Trung Tín      - MSSV: 524K0033
+'           3. Phan Nguyễn Thảo Như - MSSV: 524V0007
+' ============================================================================
+!theme plain
+left to right direction
+skinparam packageStyle rectangle
+skinparam actorStyle awesome
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 13
+
+header Nhóm thực hiện: Trần Minh Nghĩa (524K0032) | Huỳnh Trung Tín (524K0033) | Phan Nguyễn Thảo Như (524V0007)
+title SƠ ĐỒ USE CASE (USE CASE DIAGRAM)\nPHÂN HỆ ĐÓNG HỌC PHÍ CỦA ỨNG DỤNG iBANKING (TDTU)
+
+' ==========================================
+' ACTORS
+' ==========================================
+actor "Khách hàng iBanking\n(Người nộp tiền)" as Payer #LightBlue
+actor "Hệ thống Email SMTP\n(Mailpit Server)" as MailServer <<External System>> #LightYellow
+actor "Hệ thống Quản lý Công nợ\nSinh viên TDTU\n(Tuition Service)" as TuitionSystem <<Internal Subsystem>> #LightGreen
+
+' ==========================================
+' SYSTEM BOUNDARY
+' ==========================================
+rectangle "Phân hệ Đóng học phí - Ứng dụng iBanking (SOA Microservices)" {
+
+    package "1. Quản lý Tài khoản & Xác thực (Auth & Account)" #F8FAFC {
+        usecase "UC01: Đăng nhập hệ thống\n(Username & Password)" as UC01
+        usecase "UC02: Xem thông tin người nộp tiền\n(Họ tên, SĐT, Email, Số dư khả dụng)" as UC02
+        usecase "UC03: Xem lịch sử giao dịch\nđã thực hiện" as UC03
+    }
+
+    package "2. Tra cứu & Khởi tạo Giao dịch Học phí (Tuition & Payment Pre-check)" #F0FDF4 {
+        usecase "UC04: Tra cứu học phí theo MSSV\n(Tự động hiển thị Họ tên SV & Số tiền)" as UC04
+        usecase "UC05: Khởi tạo giao dịch\nthanh toán toàn bộ học phí" as UC05
+        usecase "UC06: Kiểm tra điều kiện khởi tạo (Pre-check)\n[Học phí tồn tại & UNPAID, Số dư >= Học phí,\nĐồng ý điều khoản, Không giữ Row Lock]" as UC06
+        usecase "UC07: Kiểm tra Idempotency-Key\n(Chống gửi trùng yêu cầu khởi tạo)" as UC07
+    }
+
+    package "3. Xác thực Giao dịch bằng OTP (OTP & Notification)" #FEFCE8 {
+        usecase "UC08: Sinh mã OTP 6 số duy nhất\n(Gắn với transaction_id, không trùng OTP active,\nTTL tối đa 5 phút trên Redis)" as UC08
+        usecase "UC09: Gửi mã OTP qua Email\ncủa người nộp tiền" as UC09
+        usecase "UC10: Nhập & Xác thực mã OTP\n(Kiểm tra còn hạn 5 phút & chỉ dùng 1 lần)" as UC10
+    }
+
+    package "4. Thực thi Thanh toán & Đảm bảo Nhất quán (Saga & Concurrency)" #FEF2F2 {
+        usecase "UC11: Hoàn tất giao dịch thanh toán\n(Saga Orchestration)" as UC11
+        usecase "UC12: Khóa Pessimistic & Trừ số dư tài khoản\n(SELECT FOR UPDATE / Atomic Balance Debit\nchống chi tiêu vượt số dư)" as UC12
+        usecase "UC13: Khóa Pessimistic & Gạch nợ học phí\n(Atomic State Transition UNPAID -> PAID\nchống thanh toán trùng 1 MSSV)" as UC13
+        usecase "UC14: Hoàn tiền tự động (Saga Compensation)\n[Khi phát hiện khoản học phí vừa được\ntài khoản khác thanh toán trước]" as UC14
+        usecase "UC15: Lưu lịch sử giao dịch\n& Kết quả cuối cùng" as UC15
+        usecase "UC16: Gửi Email biên lai xác nhận\ngiao dịch thành công" as UC16
+    }
+}
+
+' ==========================================
+' ACTOR RELATIONSHIPS
+' ==========================================
+Payer --> UC01 : Thực hiện đăng nhập
+Payer --> UC02 : Xem thông tin & số dư
+Payer --> UC03 : Tra cứu lịch sử GD
+Payer --> UC04 : Nhập MSSV cần đóng
+Payer --> UC05 : Nhấn "Xác nhận giao dịch"
+Payer --> UC10 : Nhập mã OTP & Xác nhận cuối
+
+UC04 --> TuitionSystem : Truy vấn dữ liệu SV & Học phí
+UC13 --> TuitionSystem : Cập nhật trạng thái PAID
+UC09 --> MailServer : Gửi email chứa OTP
+UC16 --> MailServer : Gửi email xác nhận thành công
+
+' ==========================================
+' INCLUDE & EXTEND RELATIONSHIPS
+' ==========================================
+' Sau khi đăng nhập mới sử dụng được các chức năng
+UC02 ..> UC01 : <<include>>
+UC03 ..> UC01 : <<include>>
+UC04 ..> UC01 : <<include>>
+UC05 ..> UC04 : <<include>>
+
+' Khi nhấn Xác nhận giao dịch (Khởi tạo)
+UC05 ..> UC06 : <<include>>
+UC05 ..> UC07 : <<include>>
+UC05 ..> UC08 : <<include>>
+UC08 ..> UC09 : <<include>>
+
+' Khi xác thực OTP thành công -> Chạy Saga hoàn tất giao dịch
+UC10 ..> UC11 : <<include>>\n(Khi OTP hợp lệ & còn hạn)
+
+' Các bước bắt buộc trong Saga hoàn tất giao dịch
+UC11 ..> UC12 : <<include>>\n(Bước 1: Kiểm tra lại số dư & Trừ tiền)
+UC11 ..> UC13 : <<include>>\n(Bước 2: Kiểm tra & Gạch nợ học phí)
+UC11 ..> UC15 : <<include>>\n(Bước 3: Ghi nhận lịch sử)
+UC11 ..> UC16 : <<include>>\n(Bước 4: Gửi email biên lai)
+
+' Xử lý ngoại lệ Concurrency bằng Saga Compensation
+UC14 .up.> UC13 : <<extend>>\n[Condition: Học phí đã PAID bởi GD khác\n=> Rollback / Refund số dư tức thời]
+
+note bottom of UC06
+  **Quy tắc nghiệp vụ bắt buộc:**
+  1. Thông tin người nộp tiền lấy tự động từ phiên đăng nhập (Read-only).
+  2. Chỉ cho phép thanh toán **TOÀN BỘ** khoản học phí (không đóng một phần).
+  3. Không khóa DB Row Lock trong 5 phút chờ nhập OTP (tránh nghẽn hệ thống).
+end note
+
+note bottom of UC10
+  **Ràng buộc bảo mật OTP:**
+  - Gắn chặt với `transaction_id` cụ thể
+  - Không trùng với bất kỳ OTP nào đang active
+  - Thời hạn hiệu lực tối đa **5 phút (300s)**
+  - Chỉ sử dụng thành công **duy nhất 1 lần**
+end note
+
+@enduml

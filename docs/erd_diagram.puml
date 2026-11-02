@@ -1,0 +1,221 @@
+@startuml erd_diagram
+' ============================================================================
+' Môn học : Kiến Trúc Hướng Dịch Vụ (504070) - HK1/2026-2027 - ĐH Tôn Đức Thắng
+' Dự án   : Phân hệ đóng học phí của ứng dụng iBanking
+' Nhóm SV : 1. Trần Minh Nghĩa      - MSSV: 524K0032
+'           2. Huỳnh Trung Tín      - MSSV: 524K0033
+'           3. Phan Nguyễn Thảo Như - MSSV: 524V0007
+' ============================================================================
+!theme plain
+hide circle
+skinparam linetype ortho
+skinparam shadowing false
+skinparam roundcorner 6
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam packageStyle rectangle
+
+header Nhóm thực hiện: Trần Minh Nghĩa (524K0032) | Huỳnh Trung Tín (524K0033) | Phan Nguyễn Thảo Như (524V0007)
+title SƠ ĐỒ THỰC THỂ QUAN HỆ - ENTITY RELATIONSHIP DIAGRAM (ERD)\nKIẾN TRÚC DATABASE-PER-SERVICE (4 PHÂN VÙNG DỮ LIỆU ĐỘC LẬP)
+
+' ==============================================================================
+' PARTITION 1: AUTH & ACCOUNT SERVICE DATABASE (PostgreSQL: account_db)
+' ==============================================================================
+package "Phân vùng 1: auth-account-service (PostgreSQL: account_db)" #EFF6FF {
+
+    entity "users_accounts" as users_accounts {
+        * **id** : UUID <<PK>>
+        --
+        * username : VARCHAR(50) <<UNIQUE, NOT NULL>>
+        * password_hash : VARCHAR(255) <<NOT NULL>>
+        * full_name : VARCHAR(100) <<NOT NULL>>
+        * phone_number : VARCHAR(20) <<NOT NULL>>
+        * email : VARCHAR(120) <<NOT NULL, INDEX>>
+        * **available_balance** : NUMERIC(15, 2) <<NOT NULL, CHECK (available_balance >= 0)>>
+        * status : VARCHAR(20) <<NOT NULL, DEFAULT 'ACTIVE'>>
+        * **version** : INTEGER <<NOT NULL, DEFAULT 1, Locking/Audit>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        * updated_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    entity "account_ledger_entries" as account_ledger_entries {
+        * **id** : UUID <<PK>>
+        --
+        * **account_id** : UUID <<FK -> users_accounts.id, NOT NULL, INDEX>>
+        * **transaction_id** : UUID <<Logical FK -> payment_transactions.id, NOT NULL, INDEX>>
+        * entry_type : VARCHAR(30) <<NOT NULL, CHECK IN ('DEBIT', 'COMPENSATION_REFUND')>>
+        * amount : NUMERIC(15, 2) <<NOT NULL, CHECK (amount > 0)>>
+        * balance_before : NUMERIC(15, 2) <<NOT NULL, CHECK (balance_before >= 0)>>
+        * balance_after : NUMERIC(15, 2) <<NOT NULL, CHECK (balance_after >= 0)>>
+        * **idempotency_key** : VARCHAR(100) <<UNIQUE, NOT NULL>>
+        * description : VARCHAR(255) <<NOT NULL>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    users_accounts ||--o{ account_ledger_entries : "1 tài khoản có nhiều\nbút toán biến động số dư"
+}
+
+' ==============================================================================
+' PARTITION 2: TUITION SERVICE DATABASE (PostgreSQL: tuition_db)
+' ==============================================================================
+package "Phân vùng 2: tuition-service (PostgreSQL: tuition_db)" #F0FDF4 {
+
+    entity "students" as students {
+        * **student_id (mssv)** : VARCHAR(20) <<PK>>
+        --
+        * full_name : VARCHAR(100) <<NOT NULL>>
+        * faculty : VARCHAR(100) <<NOT NULL>>
+        * major : VARCHAR(100) <<NOT NULL>>
+        * class_code : VARCHAR(30) <<NOT NULL>>
+        * email : VARCHAR(120) <<UNIQUE, NOT NULL>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    entity "tuition_bills" as tuition_bills {
+        * **id** : UUID <<PK>>
+        --
+        * **student_id** : VARCHAR(20) <<FK -> students.student_id, NOT NULL, INDEX>>
+        * semester_code : VARCHAR(20) <<NOT NULL, DEFAULT 'HK1_2026_2027'>>
+        * semester_name : VARCHAR(100) <<NOT NULL>>
+        * **amount** : NUMERIC(15, 2) <<NOT NULL, CHECK (amount > 0)>>
+        * **status** : VARCHAR(20) <<NOT NULL, DEFAULT 'UNPAID', CHECK IN ('UNPAID', 'PAID')>>
+        * **paid_transaction_id** : UUID <<NULLABLE, UNIQUE, Logical FK -> payment_transactions.id>>
+        * **paid_by_account_id** : UUID <<NULLABLE, Logical FK -> users_accounts.id>>
+        * paid_at : TIMESTAMPTZ <<NULLABLE>>
+        * **version** : INTEGER <<NOT NULL, DEFAULT 1, Locking/Audit>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        * updated_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        --
+        <<UNIQUE (student_id, semester_code)>>
+    }
+
+    students ||--o{ tuition_bills : "1 sinh viên TDTU có\nkhoản học phí theo học kỳ"
+}
+
+' ==============================================================================
+' PARTITION 3: PAYMENT SERVICE DATABASE (PostgreSQL: payment_db)
+' ==============================================================================
+package "Phân vùng 3: payment-service [Saga Orchestrator] (PostgreSQL: payment_db)" #FEF2F2 {
+
+    entity "payment_transactions" as payment_transactions {
+        * **id** : UUID <<PK>>
+        --
+        * **transaction_code** : VARCHAR(32) <<UNIQUE, NOT NULL>>
+        * **payer_account_id** : UUID <<Logical FK -> users_accounts.id, NOT NULL, INDEX>>
+        * payer_full_name : VARCHAR(100) <<NOT NULL, Snapshot>>
+        * payer_phone : VARCHAR(20) <<NOT NULL, Snapshot>>
+        * payer_email : VARCHAR(120) <<NOT NULL, Snapshot>>
+        * **student_id** : VARCHAR(20) <<Logical FK -> students.student_id, NOT NULL, INDEX>>
+        * student_full_name : VARCHAR(100) <<NOT NULL, Snapshot>>
+        * **tuition_bill_id** : UUID <<Logical FK -> tuition_bills.id, NOT NULL, INDEX>>
+        * semester_code : VARCHAR(20) <<NOT NULL>>
+        * **amount** : NUMERIC(15, 2) <<NOT NULL, CHECK (amount > 0)>>
+        * **terms_accepted** : BOOLEAN <<NOT NULL, CHECK (terms_accepted = TRUE)>>
+        * **status** : VARCHAR(30) <<NOT NULL, CHECK IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'EXPIRED')>>
+        * failure_reason : VARCHAR(255) <<NULLABLE>>
+        * **idempotency_key** : VARCHAR(100) <<UNIQUE, NOT NULL>>
+        * correlation_id : VARCHAR(64) <<NOT NULL, INDEX>>
+        * otp_expires_at : TIMESTAMPTZ <<NOT NULL>>
+        * completed_at : TIMESTAMPTZ <<NULLABLE>>
+        * **version** : INTEGER <<NOT NULL, DEFAULT 1, Locking/Audit>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        * updated_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    entity "saga_step_logs" as saga_step_logs {
+        * **id** : UUID <<PK>>
+        --
+        * **transaction_id** : UUID <<FK -> payment_transactions.id, NOT NULL, INDEX>>
+        * step_order : INTEGER <<NOT NULL>>
+        * step_name : VARCHAR(50) <<NOT NULL, e.g., VERIFY_OTP, DEBIT_ACCOUNT, MARK_TUITION_PAID, COMPENSATE_REFUND, SEND_EMAIL>>
+        * target_service : VARCHAR(50) <<NOT NULL>>
+        * step_status : VARCHAR(20) <<NOT NULL, CHECK IN ('SUCCESS', 'FAILED', 'COMPENSATED')>>
+        * detail_payload : JSONB <<NULLABLE>>
+        * error_message : TEXT <<NULLABLE>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    entity "idempotency_records" as idempotency_records {
+        * **idempotency_key** : VARCHAR(100) <<PK>>
+        --
+        * account_id : UUID <<NOT NULL, INDEX>>
+        * endpoint : VARCHAR(100) <<NOT NULL>>
+        * request_hash : VARCHAR(64) <<NOT NULL>>
+        * response_status_code : INTEGER <<NULLABLE>>
+        * response_body : JSONB <<NULLABLE>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        * expires_at : TIMESTAMPTZ <<NOT NULL>>
+    }
+
+    payment_transactions ||--o{ saga_step_logs : "1 giao dịch lưu vết\nnhiều bước điều phối Saga"
+}
+
+' ==============================================================================
+' PARTITION 4: NOTIFICATION & OTP SERVICE (Redis Cache + PostgreSQL: notification_db)
+' ==============================================================================
+package "Phân vùng 4: notification-otp-service (Redis Store TTL=300s + PostgreSQL: notification_db)" #FEFCE8 {
+
+    entity "otp_tokens" as otp_tokens {
+        * **id** : UUID <<PK>>
+        --
+        * **transaction_id** : UUID <<Logical FK -> payment_transactions.id, UNIQUE, NOT NULL, INDEX>>
+        * **otp_code** : VARCHAR(6) <<NOT NULL, UNIQUE among active OTPs>>
+        * recipient_email : VARCHAR(120) <<NOT NULL>>
+        * **is_used** : BOOLEAN <<NOT NULL, DEFAULT FALSE, CHECK (One-time use only)>>
+        * attempt_count : INTEGER <<NOT NULL, DEFAULT 0, CHECK (attempt_count <= 5)>>
+        * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+        * **expires_at** : TIMESTAMPTZ <<NOT NULL, CHECK (expires_at = created_at + INTERVAL '5 minutes')>>
+        * used_at : TIMESTAMPTZ <<NULLABLE>>
+        --
+        **Redis Fast-Path Keys (TTL = 300s):**
+        - `otp:tx:{transaction_id}` -> JSON(otp_code, email, expires_at, is_used)
+        - `otp:active_code:{otp_code}` -> `{transaction_id}` (SET NX EX 300 chống trùng OTP)
+    }
+
+    entity "notification_logs" as notification_logs {
+        * **id** : UUID <<PK>>
+        --
+        * **transaction_id** : UUID <<Logical FK -> payment_transactions.id, NOT NULL, INDEX>>
+        * **otp_token_id** : UUID <<FK -> otp_tokens.id, NULLABLE>>
+        * recipient_email : VARCHAR(120) <<NOT NULL>>
+        * notification_type : VARCHAR(30) <<NOT NULL, CHECK IN ('OTP_EMAIL', 'PAYMENT_RECEIPT_EMAIL')>>
+        * email_subject : VARCHAR(255) <<NOT NULL>>
+        * email_body_snapshot : TEXT <<NOT NULL>>
+        * delivery_status : VARCHAR(20) <<NOT NULL, CHECK IN ('SENT', 'FAILED')>>
+        * smtp_response : VARCHAR(255) <<NULLABLE>>
+        * sent_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
+    }
+
+    otp_tokens |o--o{ notification_logs : "1 mã OTP gắn với\nlog gửi email OTP"
+}
+
+' ==============================================================================
+' CROSS-SERVICE LOGICAL RELATIONSHIPS (SOAs / Loose Coupling via UUID/MSSV)
+' ==============================================================================
+users_accounts ||..o{ payment_transactions : "Logical FK: payer_account_id\n(1 người nộp tiền thực hiện nhiều GD)"
+students ||..o{ payment_transactions : "Logical FK: student_id (MSSV)\n(Đóng học phí cho SV)"
+tuition_bills ||..o{ payment_transactions : "Logical FK: tuition_bill_id\n(Chỉ 1 GD đạt trạng thái COMPLETED)"
+payment_transactions ||..|| otp_tokens : "Logical FK: transaction_id\n(Mỗi GD gắn chặt với 1 OTP duy nhất)"
+payment_transactions ||..o{ notification_logs : "Logical FK: transaction_id\n(Lưu vết gửi Email OTP & Biên lai)"
+payment_transactions ||..o{ account_ledger_entries : "Logical FK: transaction_id\n(Đối soát bút toán trừ/hoàn tiền)"
+
+note bottom of tuition_bills
+  **Chiến lược Concurrency 2 (Nhiều tài khoản đóng cùng 1 MSSV):**
+  - Không khóa bản ghi trong 5 phút chờ nhập OTP.
+  - Ngay khi OTP được xác thực thành công:
+    Thực thi `SELECT ... FROM tuition_bills WHERE id = :id FOR UPDATE`
+    và `UPDATE tuition_bills SET status = 'PAID', paid_transaction_id = :tx_id, version = version + 1 WHERE id = :id AND status = 'UNPAID'`.
+  - Ràng buộc `paid_transaction_id UNIQUE` và kiểm tra `status = 'UNPAID'` đảm bảo
+    chỉ **DUY NHẤT 1 giao dịch** thanh toán thành công.
+end note
+
+note bottom of users_accounts
+  **Chiến lược Concurrency 1 (Nhiều GD đồng thời trên 1 tài khoản):**
+  - Ngay khi OTP được xác thực thành công:
+    Thực thi `SELECT ... FROM users_accounts WHERE id = :id FOR UPDATE`
+    và `UPDATE users_accounts SET available_balance = available_balance - :amount, version = version + 1`
+    `WHERE id = :id AND available_balance >= :amount`.
+  - Kết hợp ràng buộc `CHECK (available_balance >= 0)` ngăn chặn tuyệt đối thấu chi.
+end note
+
+@enduml
