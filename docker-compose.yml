@@ -1,0 +1,219 @@
+services:
+  # ==========================================================================
+  # 1. POSTGRESQL 16 (Khởi tạo 4 Databases độc lập: Database-per-Service)
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ibanking-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-multiple-dbs.sql:/docker-entrypoint-initdb.d/init-multiple-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 2. REDIS 7 (Lưu trữ OTP TTL 300s, Lua One-Time Verify & Distributed Lock)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: ibanking-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 3. MAILPIT (SMTP Server cổng 1025 & Giao diện Web xem Email cổng 8025)
+  # ==========================================================================
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: ibanking-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 4. MICROSERVICE 1: auth-account-service (Port 8001 -> account_db)
+  # ==========================================================================
+  auth-account-service:
+    build:
+      context: ./services/auth-account-service
+      dockerfile: Dockerfile
+    container_name: ibanking-auth-account-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: auth-account-service
+      ACCOUNT_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/account_db
+      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 5. MICROSERVICE 2: tuition-service (Port 8002 -> tuition_db)
+  # ==========================================================================
+  tuition-service:
+    build:
+      context: ./services/tuition-service
+      dockerfile: Dockerfile
+    container_name: ibanking-tuition-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: tuition-service
+      TUITION_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/tuition_db
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 6. MICROSERVICE 4: notification-otp-service (Port 8004 -> notification_db + Redis + Mailpit)
+  # ==========================================================================
+  notification-otp-service:
+    build:
+      context: ./services/notification-otp-service
+      dockerfile: Dockerfile
+    container_name: ibanking-notification-otp-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: notification-otp-service
+      NOTIFICATION_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/notification_db
+      REDIS_URL: redis://redis:6379/0
+      OTP_TTL_SECONDS: 300
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_FROM_EMAIL: ibanking-noreply@tdtu.edu.vn
+      SMTP_FROM_NAME: TDTU iBanking System
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 7. MICROSERVICE 3: payment-service [Saga Orchestrator] (Port 8003 -> payment_db)
+  # ==========================================================================
+  payment-service:
+    build:
+      context: ./services/payment-service
+      dockerfile: Dockerfile
+    container_name: ibanking-payment-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: payment-service
+      PAYMENT_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/payment_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
+      JWT_ALGORITHM: HS256
+      OTP_TTL_SECONDS: 300
+      AUTH_ACCOUNT_SERVICE_URL: http://auth-account-service:8001
+      TUITION_SERVICE_URL: http://tuition-service:8002
+      NOTIFICATION_OTP_SERVICE_URL: http://notification-otp-service:8004
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth-account-service:
+        condition: service_started
+      tuition-service:
+        condition: service_started
+      notification-otp-service:
+        condition: service_started
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 8. API GATEWAY (Port 8000 -> Single Entry Point)
+  # ==========================================================================
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: ibanking-api-gateway
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: api-gateway
+      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
+      JWT_ALGORITHM: HS256
+      AUTH_ACCOUNT_SERVICE_URL: http://auth-account-service:8001
+      TUITION_SERVICE_URL: http://tuition-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8003
+      NOTIFICATION_OTP_SERVICE_URL: http://notification-otp-service:8004
+    ports:
+      - "8000:8000"
+    depends_on:
+      - auth-account-service
+      - tuition-service
+      - payment-service
+      - notification-otp-service
+    networks:
+      - ibanking-net
+
+  # ==========================================================================
+  # 9. FRONTEND WEB UI (React + Vite + Tailwind CSS -> Port 5173)
+  # ==========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ibanking-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_GATEWAY_URL: http://localhost:8000/api/v1
+      VITE_MAILPIT_WEB_URL: http://localhost:8025
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api-gateway
+    networks:
+      - ibanking-net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  ibanking-net:
+    driver: bridge
