@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, Tuple
 from uuid import UUID
 import httpx
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import PaymentTransaction, SagaStepLog, IdempotencyRecord
@@ -120,6 +121,7 @@ def save_idempotency(
     if existing:
         existing.response_status_code = status_code
         existing.response_body = response_body
+        db.commit()
     else:
         record = IdempotencyRecord(
             idempotency_key=idempotency_key,
@@ -132,7 +134,19 @@ def save_idempotency(
             expires_at=now + timedelta(hours=24),
         )
         db.add(record)
-    db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raced = (
+                db.query(IdempotencyRecord)
+                .filter(IdempotencyRecord.idempotency_key == idempotency_key)
+                .first()
+            )
+            if raced:
+                raced.response_status_code = status_code
+                raced.response_body = response_body
+                db.commit()
 
     set_idempotency_in_redis(
         idempotency_key=idempotency_key,

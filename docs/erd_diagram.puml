@@ -109,7 +109,10 @@ package "Phân vùng 3: payment-service [Saga Orchestrator] (PostgreSQL: payment
         * student_full_name : VARCHAR(100) <<NOT NULL, Snapshot>>
         * **tuition_bill_id** : UUID <<Logical FK -> tuition_bills.id, NOT NULL, INDEX>>
         * semester_code : VARCHAR(20) <<NOT NULL>>
+        * semester_name : VARCHAR(100) <<NOT NULL>>
         * **amount** : NUMERIC(15, 2) <<NOT NULL, CHECK (amount > 0)>>
+        * balance_before : NUMERIC(15, 2) <<NULLABLE>>
+        * balance_after : NUMERIC(15, 2) <<NULLABLE>>
         * **terms_accepted** : BOOLEAN <<NOT NULL, CHECK (terms_accepted = TRUE)>>
         * **status** : VARCHAR(30) <<NOT NULL, CHECK IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED', 'EXPIRED')>>
         * failure_reason : VARCHAR(255) <<NULLABLE>>

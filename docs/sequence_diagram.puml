@@ -50,7 +50,7 @@ Gateway --> User : Hiển thị Họ tên SV & Số tiền học phí\n(Bật n�
 ' ==============================================================================
 == Giai đoạn 2: Khởi tạo Giao dịch (Pre-check điều kiện, KHÔNG giữ DB Row Lock trong 5 phút chờ OTP) ==
 
-User -> Gateway : Nhấn "Xác nhận giao dịch"\nPOST /api/v1/payments/initiate\n(Headers: Authorization, Idempotency-Key)\nBody: { student_id, tuition_bill_id, terms_accepted: true }
+User -> Gateway : Nhấn "Xác nhận giao dịch"\nPOST /api/v1/payments/initiate\n(Headers: Authorization, Idempotency-Key)\nBody: { student_id, tuition_bill_id, amount, terms_accepted: true }
 Gateway -> PaymentSvc : POST /payments/initiate (X-Request-ID, X-User-ID, Idempotency-Key)
 
 PaymentSvc -> PaymentSvc : Kiểm tra Redis `idempotency:{key}` & PostgreSQL `idempotency_records`\n(Nếu trùng key -> Trả về kết quả đã cache)
@@ -70,7 +70,7 @@ end note
 
 PaymentSvc -> PaymentSvc : INSERT INTO payment_transactions\n(status = 'PENDING_OTP', amount = full_tuition_amount,\notp_expires_at = NOW() + 5 minutes)
 
-PaymentSvc -> OtpSvc : POST /internal/otp/generate (+ X-Internal-Service-Token)\n{ transaction_id, recipient_email, student_id, amount }
+PaymentSvc -> OtpSvc : POST /internal/otp/generate (+ X-Internal-Service-Token)\n{ transaction_id, transaction_code, recipient_email, payer_name, student_id, student_name, semester_name, amount }
 
 loop Sinh mã OTP 6 chữ số không trùng với bất kỳ OTP nào đang active
     OtpSvc -> Redis : SET otp:active_code:{otp_code} {transaction_id} NX EX 300
@@ -85,10 +85,11 @@ alt SMTP gửi thành công
     PaymentSvc --> Gateway : 201 Created { transaction_id, status: 'PENDING_OTP', expires_in: 300 }
     Gateway --> User : Hiển thị Modal nhập OTP (Đếm ngược 05:00)
 else SMTP lỗi exception
-    OtpSvc -> OtpSvc : INSERT INTO notification_logs (type='OTP_EMAIL', delivery_status='FAILED')
+    OtpSvc -> OtpSvc : Đánh dấu `otp_tokens.is_used = TRUE` (hủy hiệu lực)\n& INSERT INTO notification_logs (type='OTP_EMAIL', delivery_status='FAILED')
     OtpSvc -> Redis : Thu hồi khóa `otp:active_code` & `otp:tx`
     OtpSvc --> PaymentSvc : 502 Bad Gateway (OTP_EMAIL_DELIVERY_FAILED)
-    PaymentSvc --> Gateway : 502 Bad Gateway (Không tạo giao dịch PENDING_OTP)
+    PaymentSvc -> PaymentSvc : Rollback phiên DB khởi tạo (không lưu PENDING_OTP)
+    PaymentSvc --> Gateway : 502 Bad Gateway (OTP_EMAIL_DELIVERY_FAILED)
     Gateway --> User : Thông báo gửi email OTP thất bại
 end
 

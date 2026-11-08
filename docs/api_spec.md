@@ -79,7 +79,7 @@ Hệ thống tuân thủ nghiêm ngặt mẫu thiết kế **Database-per-Servic
   - `internal_network` (`driver: bridge`, **`internal: true`**): cô lập hoàn toàn `postgres`, `redis`, `auth-account-service`, `tuition-service`, `payment-service`, `notification-otp-service` (tất cả đều dùng `expose:`, không mở port trực tiếp ra host hay internet). `api-gateway` và `mailpit` gắn với cả hai mạng để làm cầu nối kiểm soát.
 - **Bảo mật Internal Endpoints (`X-Internal-Service-Token`):** Mọi route `/internal/*` trên `auth-account-service`, `tuition-service` và `notification-otp-service` đều bắt buộc xác thực header `X-Internal-Service-Token` khớp với biến môi trường `INTERNAL_SERVICE_SECRET` (trả về `403 Forbidden - FORBIDDEN_INTERNAL_API` nếu thiếu hoặc sai token). Chỉ `payment-service` và `api-gateway` đính kèm token này khi giao tiếp nội bộ.
 - **CORS (`CORS_ORIGINS`):** Cả 5 service đều đọc danh sách origin được phép từ biến môi trường `CORS_ORIGINS` (mặc định: `http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000`) đi kèm `allow_credentials=True`, thay cho `["*"]`.
-- **Ghi chú về Endpoint Demo & Tài khoản mẫu:** Các endpoint `GET /api/v1/accounts/demo-users` và `POST /api/v1/system/reset-demo` cùng danh sách tài khoản mẫu (`nguyenvana`, `tranvanb`, ... với mật khẩu phát triển `Password@123`) được mở có chủ đích trong phạm vi bài đồ án để phục vụ **giảng viên chấm điểm trực tiếp trên lớp và bộ kiểm thử tự động (E2E & Concurrency Tests)**; các thông tin này chỉ là dữ liệu giả lập phát triển, không dùng cho môi trường production.
+- **Ghi chú về Endpoint Demo & Tài khoản mẫu (`ENABLE_DEMO_ENDPOINTS`):** Các endpoint `GET /api/v1/accounts/demo-users`, `GET /api/v1/payments/{transaction_id}/demo-otp` và `POST /api/v1/system/reset-demo` được điều khiển bởi cờ cấu hình `ENABLE_DEMO_ENDPOINTS` tại `api-gateway` (mặc định `true` để phục vụ **giảng viên chấm điểm trực tiếp trên lớp và bộ kiểm thử tự động**, có thể đặt `false` để trả `403 DEMO_ENDPOINTS_DISABLED` khi triển khai ngoài phạm vi demo). Danh sách tài khoản mẫu (`nguyenvana`, `tranvanb`, ... với mật khẩu phát triển `Password@123`) chỉ là dữ liệu giả lập phát triển.
 
 ---
 
@@ -356,7 +356,7 @@ Hệ thống tuân thủ nghiêm ngặt mẫu thiết kế **Database-per-Servic
 - **Method:** `GET`
 - **Service đích:** `payment-service (:8003)`
 - **Headers:** `Authorization: Bearer <token>`
-- **Query Parameters:** `limit=20&offset=0&status=COMPLETED` *(Tùy chọn)*
+- **Query Parameters:** `limit=50&offset=0&status=COMPLETED` *(Tùy chọn; hỗ trợ cả `status` và `status_filter`)*
 
 #### Response `200 OK`:
 ```json
@@ -364,24 +364,40 @@ Hệ thống tuân thủ nghiêm ngặt mẫu thiết kế **Database-per-Servic
   "total": 2,
   "items": [
     {
-      "transaction_id": "33333333-3333-3333-3333-333333333301",
+      "id": "33333333-3333-3333-3333-333333333301",
       "transaction_code": "TXN-20261027-894120",
+      "payer_account_id": "11111111-1111-1111-1111-111111111101",
+      "payer_full_name": "Nguyễn Văn A",
+      "payer_phone": "0901234567",
+      "payer_email": "nguyenvana@tdtu.edu.vn",
       "student_id": "52200001",
       "student_full_name": "Trần Minh Khoa",
+      "tuition_bill_id": "22222222-2222-2222-2222-222222222201",
       "semester_code": "HK1_2026_2027",
+      "semester_name": "Học kỳ 1 - Năm học 2026-2027",
       "amount": 14500000.00,
+      "balance_before": 25000000.00,
+      "balance_after": 10500000.00,
       "status": "COMPLETED",
       "failure_reason": null,
       "created_at": "2026-10-27T23:00:00Z",
       "completed_at": "2026-10-27T23:01:15Z"
     },
     {
-      "transaction_id": "33333333-3333-3333-3333-333333333302",
+      "id": "33333333-3333-3333-3333-333333333302",
       "transaction_code": "TXN-20261027-901452",
+      "payer_account_id": "11111111-1111-1111-1111-111111111102",
+      "payer_full_name": "Trần Văn B",
+      "payer_phone": "0902345678",
+      "payer_email": "tranvanb@tdtu.edu.vn",
       "student_id": "52200001",
       "student_full_name": "Trần Minh Khoa",
+      "tuition_bill_id": "22222222-2222-2222-2222-222222222201",
       "semester_code": "HK1_2026_2027",
+      "semester_name": "Học kỳ 1 - Năm học 2026-2027",
       "amount": 14500000.00,
+      "balance_before": 30000000.00,
+      "balance_after": 30000000.00,
       "status": "COMPENSATED",
       "failure_reason": "Khoản học phí đã được thanh toán bởi một giao dịch khác. Đã hoàn tiền tự động.",
       "created_at": "2026-10-27T23:00:02Z",
@@ -429,8 +445,8 @@ Các API dưới đây chỉ được `expose:` trong mạng nội bộ cách ly
 
 | Method | URI | Mục đích & Cơ chế Bảo mật OTP | Request Body | Response Codes |
 | :---: | :--- | :--- | :--- | :---: |
-| `POST` | `/internal/otp/generate` | Sinh OTP 6 chữ số gắn với `transaction_id`, chống trùng bằng `SET otp:active_code:{code} NX EX 300`, lưu Redis (`TTL=300s`) + `otp_tokens`, gửi email qua SMTP và lưu `notification_logs` (`SENT` hoặc `FAILED`). Trả `502 OTP_EMAIL_DELIVERY_FAILED` nếu SMTP thất bại. | `{ "transaction_id", "recipient_email", "payer_name", "student_id", "student_name", "amount" }` | `201 Created`, `403`, `502 (OTP_EMAIL_DELIVERY_FAILED)` |
+| `POST` | `/internal/otp/generate` | Sinh OTP 6 chữ số gắn với `transaction_id`, chống trùng bằng `SET otp:active_code:{code} NX EX 300`, lưu Redis (`TTL=300s`) + `otp_tokens`, gửi email qua SMTP và lưu `notification_logs` (`SENT` hoặc `FAILED`). Nếu SMTP thất bại: vô hiệu hóa `otp_tokens` (`is_used=TRUE`), xóa Redis key và trả `502 OTP_EMAIL_DELIVERY_FAILED`. | `{ "transaction_id", "transaction_code", "recipient_email", "payer_name", "student_id", "student_name", "semester_name", "amount" }` | `201 Created`, `403`, `502 (OTP_EMAIL_DELIVERY_FAILED)` |
 | `POST` | `/internal/otp/verify` | Thực thi **Redis Lua Script** kiểm tra mã OTP khớp với `transaction_id`, còn hạn 5 phút, `is_used == false`, và lập tức đánh dấu `is_used = true` (dùng 1 lần) + cập nhật bảng `otp_tokens`. | `{ "transaction_id", "otp_code" }` | `200 OK`, `400 (INVALID_OTP / OTP_EXPIRED)`, `403`, `409 (OTP_ALREADY_USED)` |
-| `POST` | `/internal/notifications/payment-receipt` | Gửi email biên lai xác nhận thanh toán học phí thành công qua SMTP và lưu vết `notification_logs` với trạng thái trung thực (`SENT` hoặc `FAILED`). | `{ "transaction_id", "transaction_code", "recipient_email", "payer_name", "student_id", "student_name", "semester_name", "amount", "paid_at" }` | `200 OK`, `403` |
+| `POST` | `/internal/notifications/payment-receipt` | Gửi email biên lai xác nhận thanh toán học phí thành công qua SMTP và lưu vết `notification_logs` với trạng thái trung thực (`SENT` hoặc `FAILED`). | `{ "transaction_id", "transaction_code", "recipient_email", "payer_name", "payer_phone", "student_id", "student_name", "semester_name", "amount", "balance_before", "balance_after", "paid_at" }` | `200 OK`, `403` |
 | `GET` | `/internal/otp/debug/{transaction_id}` | Tra cứu nhanh OTP phục vụ Automated Tests / Demo qua `payment-service`. | `-` | `200 OK`, `403`, `404` |
 | `POST` | `/internal/otp/reset-demo` | Xóa sạch OTP & notification logs khi reset dữ liệu demo. | `-` | `200 OK`, `403` |

@@ -1,12 +1,17 @@
 """
 KIỂM THỬ BỔ SUNG CHO CÁC TRƯỜNG HỢP BIÊN & BẢO MẬT (EDGE CASES & SECURITY TESTS)
-Kiểm chứng đầy đủ 4 kịch bản trọng yếu:
+Kiểm chứng đầy đủ các kịch bản trọng yếu:
 1. Gọi trực tiếp /internal/* không có hoặc sai X-Internal-Service-Token -> 403 Forbidden.
-2. Khi mailer.py gặp lỗi SMTP -> trả về "FAILED" (không trả về "SENT" giả) & /internal/otp/generate trả 502.
+2. Khi mailer.py gặp lỗi SMTP -> trả về "FAILED" (không trả về "SENT" giả), /internal/otp/generate
+   trả 502 và vô hiệu hóa OtpToken trong DB (is_used=True) đồng bộ với xóa Redis.
 3. Khi bước refund trong Saga thất bại -> retry tối đa 3 lần rồi chuyển sang COMPENSATION_FAILED,
    restored_balance = None (không báo COMPENSATED giả).
 4. Khi gửi email biên lai thất bại sau khi đã trừ tiền và gạch nợ -> DB vẫn commit COMPLETED
    trước khi gửi email, HTTP trả 200 với status="COMPLETED", receipt_email_sent=False và log RECEIPT_EMAIL_FAILED.
+5. Xác minh Redis Distributed Lock & Redis Idempotency Cache trong payment-service.
+6. Công tắc ENABLE_DEMO_ENDPOINTS tại API Gateway (tắt trả 403 DEMO_ENDPOINTS_DISABLED, bật cho đi qua).
+7. Query param ?status= trên /payments/history, save_idempotency cho nhánh lỗi (409/502),
+   IntegrityError fallback trên /payments/initiate và httpx.RequestError -> 503 trên demo-otp/reset-demo.
 """
 
 from contextlib import contextmanager
@@ -26,11 +31,13 @@ for _s in (sys.stdout, sys.stderr):
         except Exception:
             pass
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -125,9 +132,27 @@ def _make_jwt(account_id: str) -> str:
 class _FakeQuery:
     def __init__(self, first_obj=None, all_objs=None):
         self._first_obj = first_obj
-        self._all_objs = all_objs if all_objs is not None else ([] if first_obj is None else [first_obj])
+        self._all_objs = list(all_objs) if all_objs is not None else ([] if first_obj is None else [first_obj])
+        self._offset = 0
+        self._limit = None
 
     def filter(self, *args, **kwargs):
+        filtered = []
+        for obj in self._all_objs:
+            matched = True
+            for crit in args:
+                left = getattr(crit, "left", None)
+                right = getattr(crit, "right", None)
+                attr_name = getattr(left, "key", None)
+                expected_val = getattr(right, "value", None)
+                if attr_name and expected_val is not None and hasattr(obj, attr_name):
+                    if getattr(obj, attr_name) != expected_val:
+                        matched = False
+                        break
+            if matched:
+                filtered.append(obj)
+        self._all_objs = filtered
+        self._first_obj = filtered[0] if filtered else None
         return self
 
     def with_for_update(self):
@@ -136,11 +161,29 @@ class _FakeQuery:
     def order_by(self, *args, **kwargs):
         return self
 
+    def offset(self, n):
+        self._offset = n or 0
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
+    def count(self):
+        return len(self._all_objs)
+
+    def delete(self):
+        count = len(self._all_objs)
+        self._all_objs.clear()
+        self._first_obj = None
+        return count
+
     def first(self):
         return self._first_obj
 
     def all(self):
-        return list(self._all_objs)
+        end = None if self._limit is None else self._offset + self._limit
+        return list(self._all_objs[self._offset:end])
 
 
 class _FakePaymentDbSession:
@@ -149,8 +192,9 @@ class _FakePaymentDbSession:
     trình tự db.commit(), trạng thái PaymentTransaction và các SagaStepLog được lưu.
     """
 
-    def __init__(self, tx_obj):
+    def __init__(self, tx_obj, extra_txs=None):
         self.tx = tx_obj
+        self.txs = list(extra_txs) if extra_txs is not None else ([tx_obj] if tx_obj is not None else [])
         self.steps = []
         self.idempotency_records = []
         self.commit_snapshots = []
@@ -160,16 +204,22 @@ class _FakePaymentDbSession:
     def query(self, model):
         model_name = getattr(model, "__name__", "")
         if model_name == "PaymentTransaction":
-            return _FakeQuery(first_obj=self.tx)
+            return _FakeQuery(all_objs=self.txs)
         if model_name == "IdempotencyRecord":
-            return _FakeQuery(first_obj=None)
+            return _FakeQuery(all_objs=self.idempotency_records)
         if model_name == "SagaStepLog":
             return _FakeQuery(all_objs=self.steps)
         return _FakeQuery(first_obj=None)
 
     def add(self, obj):
         cls_name = obj.__class__.__name__
-        if cls_name == "SagaStepLog":
+        if cls_name == "PaymentTransaction":
+            if getattr(obj, "id", None) is None:
+                obj.id = uuid.uuid4()
+            self.tx = obj
+            if obj not in self.txs:
+                self.txs.append(obj)
+        elif cls_name == "SagaStepLog":
             self.steps.append(obj)
         elif cls_name == "IdempotencyRecord":
             self.idempotency_records.append(obj)
@@ -473,8 +523,14 @@ def test_mailer_returns_failed_on_smtp_error() -> None:
         assert notif_logs[0].delivery_status == "FAILED", (
             f"NotificationLog phải lưu FAILED nhưng thực tế: {notif_logs[0].delivery_status}"
         )
+        otp_tokens = [o for o in added_objects if o.__class__.__name__ == "OtpToken"]
+        assert len(otp_tokens) == 1
+        assert otp_tokens[0].is_used is True, (
+            "OtpToken phải bị đánh dấu is_used=True khi gửi SMTP thất bại (không để OTP sống trong DB)!"
+        )
+        assert otp_tokens[0].used_at is not None
         assert fake_redis.delete.call_count >= 2
-        print("[✓] /internal/otp/generate lưu NotificationLog(FAILED), thu hồi OTP Redis và trả HTTP 502.")
+        print("[✓] /internal/otp/generate lưu NotificationLog(FAILED), vô hiệu hóa OtpToken (is_used=True), xóa Redis và trả HTTP 502.")
 
 
 def test_saga_compensation_failed_when_refund_fails() -> None:
@@ -781,12 +837,347 @@ def test_payment_redis_locks_and_idempotency() -> None:
             print("[✓] Redis lock:account, lock:tuition (SET NX PX + Lua unlock) và idempotency:{key} fast-path hoạt động chính xác.")
 
 
+def test_demo_endpoints_toggle_on_api_gateway() -> None:
+    """
+    Kiểm thử 6: Khi ENABLE_DEMO_ENDPOINTS=False trên API Gateway, cả 3 endpoint demo
+    (/accounts/demo-users, /payments/{id}/demo-otp, /system/reset-demo) phải trả 403 DEMO_ENDPOINTS_DISABLED;
+    khi bật True, yêu cầu được forward bình thường.
+    """
+    print("\n" + "=" * 80)
+    print("TEST BIÊN 6: CÔNG TẮC ENABLE_DEMO_ENDPOINTS TRÊN API GATEWAY")
+    print("=" * 80)
+
+    with _service_import_context("api-gateway"):
+        from app import main as gw_main
+        from app.config import settings as gw_settings
+
+        client = TestClient(gw_main.app)
+        payer_jwt = _make_jwt("11111111-1111-1111-1111-111111111101")
+        tx_id = str(uuid.uuid4())
+
+        # 1. Tắt ENABLE_DEMO_ENDPOINTS -> 403 DEMO_ENDPOINTS_DISABLED
+        with patch.object(gw_settings, "ENABLE_DEMO_ENDPOINTS", False):
+            r_demo_users = client.get("/api/v1/accounts/demo-users")
+            r_demo_otp = client.get(
+                f"/api/v1/payments/{tx_id}/demo-otp",
+                headers={"Authorization": f"Bearer {payer_jwt}"},
+            )
+            r_reset = client.post("/api/v1/system/reset-demo")
+
+            for label, resp in (
+                ("GET /api/v1/accounts/demo-users", r_demo_users),
+                ("GET /api/v1/payments/{id}/demo-otp", r_demo_otp),
+                ("POST /api/v1/system/reset-demo", r_reset),
+            ):
+                assert resp.status_code == 403, f"{label} khi tắt phải trả 403, nhận: {resp.status_code}"
+                assert resp.json()["error"]["code"] == "DEMO_ENDPOINTS_DISABLED"
+
+        # 2. Bật ENABLE_DEMO_ENDPOINTS -> forward_request được gọi
+        mock_forward = AsyncMock(
+            side_effect=lambda *args, **kwargs: JSONResponse(status_code=200, content={"ok": True})
+        )
+        with (
+            patch.object(gw_settings, "ENABLE_DEMO_ENDPOINTS", True),
+            patch.object(gw_main, "forward_request", mock_forward),
+        ):
+            r1 = client.get("/api/v1/accounts/demo-users")
+            r2 = client.get(
+                f"/api/v1/payments/{tx_id}/demo-otp",
+                headers={"Authorization": f"Bearer {payer_jwt}"},
+            )
+            r3 = client.post("/api/v1/system/reset-demo")
+            assert (r1.status_code, r2.status_code, r3.status_code) == (200, 200, 200)
+            assert mock_forward.await_count == 3
+
+        print("[✓] Công tắc ENABLE_DEMO_ENDPOINTS chặn 403 khi False và forward bình thường khi True.")
+
+
+def test_payment_history_status_error_idempotency_and_request_errors() -> None:
+    """
+    Kiểm thử 7:
+    - GET /payments/history hỗ trợ cả ?status= (đúng api_spec.md) lẫn ?status_filter=.
+    - confirm-otp lưu Idempotency cache cho cả nhánh lỗi (INSUFFICIENT_BALANCE, COMPENSATED, COMPENSATION_FAILED)
+      và replay lại đúng status/envelope ở lần gửi trùng.
+    - /payments/initiate bắt IntegrityError khi 2 request trùng Idempotency-Key đồng thời và replay cache thay vì 500.
+    - /payments/{id}/demo-otp và /payments/reset-demo trả 503 gọn gàng khi httpx.RequestError.
+    """
+    print("\n" + "=" * 80)
+    print("TEST BIÊN 7: ?status= FILTER, ERROR IDEMPOTENCY, RACE INTEGRITY ERROR & 503 REQUEST ERROR")
+    print("=" * 80)
+
+    with _service_import_context("payment-service"):
+        from app.main import app
+        from app.database import get_db
+        from app.models import PaymentTransaction
+        from app import saga as payment_saga
+        from app.routers import payments as payments_router
+
+        payer_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+
+        def _make_tx(tx_status: str, student_id: str) -> PaymentTransaction:
+            return PaymentTransaction(
+                id=uuid.uuid4(),
+                transaction_code=f"TXN-20261108-{uuid.uuid4().hex[:6].upper()}",
+                payer_account_id=payer_id,
+                payer_full_name="Nguyễn Văn A",
+                payer_phone="0901234567",
+                payer_email="nguyenvana@tdtu.edu.vn",
+                student_id=student_id,
+                student_full_name="Sinh Viên Test",
+                tuition_bill_id=uuid.uuid4(),
+                semester_code="HK1_2026_2027",
+                semester_name="Học kỳ 1 - Năm học 2026-2027",
+                amount=Decimal("14500000.00"),
+                terms_accepted=True,
+                status=tx_status,
+                idempotency_key=f"init-{uuid.uuid4().hex}",
+                correlation_id=str(uuid.uuid4()),
+                otp_expires_at=now + timedelta(minutes=5),
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+
+        # Part A: GET /payments/history?status=COMPLETED & ?status_filter=FAILED
+        tx_completed = _make_tx("COMPLETED", "52200001")
+        tx_failed = _make_tx("FAILED", "524K0032")
+        hist_db = _FakePaymentDbSession(tx_completed, extra_txs=[tx_completed, tx_failed])
+        app.dependency_overrides[get_db] = lambda: hist_db
+        client = TestClient(app)
+
+        auth_headers = {"Authorization": f"Bearer {_make_jwt(str(payer_id))}"}
+        r_status = client.get("/payments/history?status=COMPLETED", headers=auth_headers)
+        r_legacy = client.get("/payments/history?status_filter=FAILED", headers=auth_headers)
+        app.dependency_overrides.clear()
+
+        assert r_status.status_code == 200
+        assert r_status.json()["total"] == 1
+        assert r_status.json()["items"][0]["status"] == "COMPLETED"
+        assert r_legacy.status_code == 200
+        assert r_legacy.json()["total"] == 1
+        assert r_legacy.json()["items"][0]["status"] == "FAILED"
+        print("[✓] GET /payments/history lọc chính xác theo cả ?status= lẫn ?status_filter=.")
+
+        # Part B: Error branch save_idempotency + replay cho INSUFFICIENT_BALANCE (409),
+        # COMPENSATED (409), COMPENSATION_FAILED (502)
+        @contextmanager
+        def _noop_locks(**kwargs):
+            yield
+
+        class _StaticPostClient:
+            def __init__(self, status_code, body):
+                self._status = status_code
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, **kwargs):
+                return httpx.Response(self._status, json=self._body)
+
+        scenarios = [
+            (
+                "INSUFFICIENT_BALANCE",
+                409,
+                "INSUFFICIENT_BALANCE",
+                httpx.Response(409, json={"error": {"code": "INSUFFICIENT_BALANCE", "message": "Số dư không đủ"}}),
+                None,
+                None,
+            ),
+            (
+                "TUITION_ALREADY_PAID_COMPENSATED",
+                409,
+                "TUITION_ALREADY_PAID_COMPENSATED",
+                httpx.Response(200, json={"balance_before": 25000000.0, "balance_after": 10500000.0}),
+                httpx.Response(409, json={"error": {"code": "TUITION_ALREADY_PAID", "message": "Đã thanh toán"}}),
+                lambda *a, **kw: _StaticPostClient(200, {"balance_after": 25000000.0}),
+            ),
+            (
+                "COMPENSATION_FAILED",
+                502,
+                "COMPENSATION_FAILED",
+                httpx.Response(200, json={"balance_before": 25000000.0, "balance_after": 10500000.0}),
+                httpx.Response(409, json={"error": {"code": "TUITION_ALREADY_PAID", "message": "Đã thanh toán"}}),
+                lambda *a, **kw: _StaticPostClient(500, {"error": {"code": "REFUND_ERROR", "message": "Lỗi DB"}}),
+            ),
+        ]
+
+        for label, expected_http, expected_code, debit_resp, tuition_resp, refund_client_factory in scenarios:
+            tx_case = _make_tx("PENDING_OTP", "52200001")
+            case_db = _FakePaymentDbSession(tx_case)
+            idem_cache = {}
+
+            def _fake_check(db, idempotency_key, account_id, endpoint, payload_dict):
+                return idem_cache.get(idempotency_key)
+
+            def _fake_save(db, idempotency_key, account_id, endpoint, payload_dict, status_code, response_body):
+                idem_cache[idempotency_key] = (status_code, response_body)
+
+            app.dependency_overrides[get_db] = lambda d=case_db: d
+            idem_key = f"idem-{label}-{uuid.uuid4().hex[:8]}"
+
+            patches = [
+                patch.object(payments_router, "acquire_payment_locks", _noop_locks),
+                patch.object(payments_router, "check_idempotency", side_effect=_fake_check),
+                patch.object(payments_router, "save_idempotency", side_effect=_fake_save),
+                patch.object(payments_router, "call_verify_otp", return_value={"verified": True}),
+                patch.object(payments_router, "call_debit_account", return_value=debit_resp),
+            ]
+            if tuition_resp is not None:
+                patches.append(patch.object(payments_router, "call_mark_tuition_paid", return_value=tuition_resp))
+            if refund_client_factory is not None:
+                patches.append(patch.object(payment_saga.httpx, "Client", refund_client_factory))
+                patches.append(patch.object(payment_saga.time, "sleep", return_value=None))
+
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                if len(patches) == 5:
+                    r_first = client.post(
+                        f"/payments/{tx_case.id}/confirm-otp",
+                        headers={**auth_headers, "Idempotency-Key": idem_key},
+                        json={"otp_code": "123456"},
+                    )
+                    assert idem_key in idem_cache
+                    # Gửi lại đúng Idempotency-Key -> replay ngay từ cache dù tx đã đổi trạng thái!
+                    r_replay = client.post(
+                        f"/payments/{tx_case.id}/confirm-otp",
+                        headers={**auth_headers, "Idempotency-Key": idem_key},
+                        json={"otp_code": "123456"},
+                    )
+                else:
+                    with patches[5], patches[6], patches[7]:
+                        r_first = client.post(
+                            f"/payments/{tx_case.id}/confirm-otp",
+                            headers={**auth_headers, "Idempotency-Key": idem_key},
+                            json={"otp_code": "123456"},
+                        )
+                        assert idem_key in idem_cache
+                        r_replay = client.post(
+                            f"/payments/{tx_case.id}/confirm-otp",
+                            headers={**auth_headers, "Idempotency-Key": idem_key},
+                            json={"otp_code": "123456"},
+                        )
+
+            app.dependency_overrides.clear()
+            assert r_first.status_code == expected_http
+            assert r_first.json()["error"]["code"] == expected_code
+            assert r_replay.status_code == expected_http
+            assert r_replay.json() == r_first.json()
+
+        print("[✓] Idempotency lưu và replay chuẩn cho cả nhánh INSUFFICIENT_BALANCE (409), COMPENSATED (409) và COMPENSATION_FAILED (502).")
+
+        # Part C: /payments/initiate IntegrityError fallback khi 2 request trùng Idempotency-Key đồng thời
+        bill_id = uuid.uuid4()
+        race_db = _FakePaymentDbSession(None)
+        cached_payload = {"transaction_id": str(uuid.uuid4()), "status": "PENDING_OTP", "from_race_cache": True}
+        check_calls = {"n": 0}
+
+        def _race_check(db, idempotency_key, account_id, endpoint, payload_dict):
+            check_calls["n"] += 1
+            if check_calls["n"] == 1:
+                return None
+            return (201, cached_payload)
+
+        app.dependency_overrides[get_db] = lambda: race_db
+        with (
+            patch.object(payments_router, "check_idempotency", side_effect=_race_check),
+            patch.object(
+                payments_router,
+                "call_precheck_account",
+                return_value={
+                    "full_name": "Nguyễn Văn A",
+                    "phone_number": "0901234567",
+                    "email": "nguyenvana@tdtu.edu.vn",
+                    "available_balance": 25000000,
+                },
+            ),
+            patch.object(
+                payments_router,
+                "call_precheck_tuition",
+                return_value={
+                    "student": {"student_id": "52200001", "full_name": "Trần Minh Khoa"},
+                    "tuition_bill": {
+                        "id": str(bill_id),
+                        "semester_code": "HK1_2026_2027",
+                        "semester_name": "Học kỳ 1",
+                        "amount": 14500000,
+                        "status": "UNPAID",
+                    },
+                },
+            ),
+            patch.object(
+                payments_router,
+                "call_generate_otp",
+                return_value={"expires_in_seconds": 300},
+            ),
+            patch.object(
+                payments_router,
+                "save_idempotency",
+                side_effect=IntegrityError("dup", {}, Exception("unique violation")),
+            ),
+        ):
+            r_race = client.post(
+                "/payments/initiate",
+                headers={**auth_headers, "Idempotency-Key": "concurrent-key-001"},
+                json={
+                    "student_id": "52200001",
+                    "tuition_bill_id": str(bill_id),
+                    "amount": 14500000,
+                    "terms_accepted": True,
+                },
+            )
+        app.dependency_overrides.clear()
+        assert r_race.status_code == 201
+        assert r_race.json()["from_race_cache"] is True
+        assert race_db.rollback_count >= 1
+
+        # Part D: httpx.RequestError trên /demo-otp và /reset-demo trả HTTP 503 gọn gàng
+        tx_demo = _make_tx("PENDING_OTP", "52200001")
+        err_db = _FakePaymentDbSession(tx_demo)
+
+        class _BrokenHttpClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get(self, url, **kwargs):
+                raise httpx.ConnectError("Connection refused")
+
+            def post(self, url, **kwargs):
+                raise httpx.ConnectError("Connection refused")
+
+        app.dependency_overrides[get_db] = lambda: err_db
+        with (
+            patch.object(payments_router, "clear_payment_redis_keys", return_value=None),
+            patch.object(payments_router.httpx, "Client", _BrokenHttpClient),
+        ):
+            r_demo_err = client.get(f"/payments/{tx_demo.id}/demo-otp", headers=auth_headers)
+            r_reset_err = client.post("/payments/reset-demo")
+        app.dependency_overrides.clear()
+
+        assert r_demo_err.status_code == 503
+        assert r_demo_err.json()["error"]["code"] == "NOTIFICATION_SERVICE_UNAVAILABLE"
+        assert r_reset_err.status_code == 503
+        assert r_reset_err.json()["error"]["code"] == "DOWNSTREAM_SERVICE_UNAVAILABLE"
+        print("[✓] IntegrityError fallback trên /payments/initiate và 503 RequestError trên /demo-otp, /reset-demo hoạt động chính xác.")
+
+
 def run_edge_cases_and_security_tests() -> None:
     test_internal_endpoints_require_token()
     test_mailer_returns_failed_on_smtp_error()
     test_saga_compensation_failed_when_refund_fails()
     test_receipt_email_failure_preserves_completed_status()
     test_payment_redis_locks_and_idempotency()
+    test_demo_endpoints_toggle_on_api_gateway()
+    test_payment_history_status_error_idempotency_and_request_errors()
 
 
 if __name__ == "__main__":

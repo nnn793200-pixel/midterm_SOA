@@ -56,28 +56,40 @@ export default function TuitionPaymentPage({
   useEffect(() => {
     const trimmed = mssvInput.trim();
     if (!trimmed || trimmed.length < 4) {
+      setIsLookingUp(false);
       setTuitionResult(null);
       setLookupError(null);
       return;
     }
 
+    let cancelled = false;
+    setIsLookingUp(true);
+    setLookupError(null);
+
     const timer = setTimeout(async () => {
-      setIsLookingUp(true);
-      setLookupError(null);
       try {
         const res = await api.lookupTuitionByMssv(trimmed);
-        setTuitionResult(res);
+        if (!cancelled) {
+          setTuitionResult(res);
+        }
       } catch (err) {
-        setTuitionResult(null);
-        setLookupError(
-          err.message || `Không tìm thấy thông tin học phí cho MSSV ${trimmed}`
-        );
+        if (!cancelled) {
+          setTuitionResult(null);
+          setLookupError(
+            err.message || `Không tìm thấy thông tin học phí cho MSSV ${trimmed}`
+          );
+        }
       } finally {
-        setIsLookingUp(false);
+        if (!cancelled) {
+          setIsLookingUp(false);
+        }
       }
     }, 300);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [mssvInput, refreshTrigger]);
 
   // Kiểm tra 4 điều kiện bắt buộc để mở khóa nút "Xác nhận giao dịch"
@@ -96,6 +108,7 @@ export default function TuitionPaymentPage({
     isTuitionUnpaid &&
     hasSufficientBalance &&
     termsAccepted &&
+    !isLookingUp &&
     !isInitiating;
 
   const handleInitiatePayment = async (e) => {

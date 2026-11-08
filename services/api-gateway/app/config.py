@@ -16,6 +16,9 @@ class Settings(BaseSettings):
         "CORS_ORIGINS",
         "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000",
     )
+    ENABLE_DEMO_ENDPOINTS: bool = os.getenv(
+        "ENABLE_DEMO_ENDPOINTS", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
 
     AUTH_ACCOUNT_SERVICE_URL: str = os.getenv(
         "AUTH_ACCOUNT_SERVICE_URL", "http://localhost:8001"

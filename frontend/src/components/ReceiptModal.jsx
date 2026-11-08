@@ -1,6 +1,7 @@
 import React from "react";
 import {
   CheckCircle2,
+  AlertTriangle,
   Mail,
   History,
   FileText,
@@ -109,23 +110,51 @@ export default function ReceiptModal({
             </div>
           </div>
 
-          <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 flex items-center justify-between text-xs text-blue-900">
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4 text-blue-700 shrink-0" />
-              <span>
-                Email xác nhận giao dịch thành công đã được gửi qua SMTP.
-              </span>
+          {receipt.receipt_email_sent !== false ? (
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 flex items-center justify-between text-xs text-blue-900">
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4 text-blue-700 shrink-0" />
+                <span>
+                  Email xác nhận giao dịch thành công đã được gửi qua SMTP.
+                </span>
+              </div>
+              <a
+                href={MAILPIT_WEB_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 font-bold text-blue-700 hover:underline shrink-0 ml-2"
+              >
+                <Mail className="w-3.5 h-3.5" />
+                <span>Xem Email</span>
+              </a>
             </div>
-            <a
-              href={MAILPIT_WEB_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 font-bold text-blue-700 hover:underline shrink-0 ml-2"
-            >
-              <Mail className="w-3.5 h-3.5" />
-              <span>Xem Email</span>
-            </a>
-          </div>
+          ) : (
+            <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 flex items-center justify-between gap-2 text-xs text-amber-900">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <p className="font-bold">
+                    Giao dịch đã thanh toán thành công nhưng gửi email biên lai
+                    gặp sự cố.
+                  </p>
+                  {receipt.message && (
+                    <p className="text-[11px] text-amber-800">
+                      {receipt.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <a
+                href={MAILPIT_WEB_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 font-bold text-amber-800 hover:underline shrink-0 ml-2"
+              >
+                <Mail className="w-3.5 h-3.5" />
+                <span>Xem Email</span>
+              </a>
+            </div>
+          )}
 
           <div className="flex items-center justify-end gap-3 pt-2">
             <button

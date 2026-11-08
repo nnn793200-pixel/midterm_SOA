@@ -89,7 +89,9 @@ export default function OtpModal({
       });
       if (
         err.code === "TUITION_ALREADY_PAID_COMPENSATED" ||
+        err.code === "TUITION_PAYMENT_FAILED_COMPENSATED" ||
         err.code === "INSUFFICIENT_BALANCE" ||
+        err.code === "COMPENSATION_FAILED" ||
         err.code === "OTP_EXPIRED"
       ) {
         onCompensatedOrFailed && onCompensatedOrFailed(err);
@@ -228,10 +230,17 @@ export default function OtpModal({
                 <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
                 <span>[{errorBox.code}] {errorBox.message}</span>
               </div>
-              {errorBox.details?.restored_balance !== undefined && (
+              {typeof errorBox.details?.restored_balance === "number" && (
                 <p className="text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5 font-semibold">
                   ✓ Saga Compensation: Số dư của bạn đã được hoàn trả nguyên vẹn (
                   {formatCurrency(errorBox.details.restored_balance)}).
+                </p>
+              )}
+              {(errorBox.code === "COMPENSATION_FAILED" ||
+                errorBox.details?.manual_reconciliation_required) && (
+                <p className="text-amber-900 bg-amber-50 border border-amber-300 rounded-lg px-2.5 py-1.5 font-semibold">
+                  ⚠ Hoàn tiền tự động gặp sự cố. Giao dịch đã được ghi nhận cần
+                  đối soát thủ công bởi bộ phận vận hành.
                 </p>
               )}
               {errorBox.correlationId && (

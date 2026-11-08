@@ -186,13 +186,19 @@ def run_e2e_workflow_test() -> None:
         assert replay_resp.status_code == 409
         print("[✓] 8C. Chặn thành công việc tái sử dụng mã OTP lần thứ 2 (One-time use).")
 
-        # 9. Kiểm tra chi tiết giao dịch & 7 bước Saga Step Logs
+        # 9. Kiểm tra chi tiết giao dịch, lọc lịch sử (?status=COMPLETED) & 7 bước Saga Step Logs
         detail_resp = client.get(f"/payments/{tx_id}", headers=auth_headers)
         assert detail_resp.status_code == 200
         saga_steps = detail_resp.json()["saga_steps"]
         assert len(saga_steps) >= 7
+        history_completed = client.get(
+            "/payments/history?status=COMPLETED", headers=auth_headers
+        )
+        assert history_completed.status_code == 200
+        history_items = history_completed.json()["items"]
+        assert any(item["id"] == tx_id and item["status"] == "COMPLETED" for item in history_items)
         print(
-            f"[✓] 9. Đối soát lịch sử giao dịch & Saga Step Logs ({len(saga_steps)} bước) hoàn tất!"
+            f"[✓] 9. Đối soát lịch sử giao dịch (?status=COMPLETED) & Saga Step Logs ({len(saga_steps)} bước) hoàn tất!"
         )
 
 

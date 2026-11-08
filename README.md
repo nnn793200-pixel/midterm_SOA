@@ -22,9 +22,9 @@ Hệ thống mô phỏng **phân hệ đóng học phí trực tuyến của ứ
 | **3. Thiết kế REST API** | `1.0đ` | Các API chính được mô tả theo REST, có request/response model, Pydantic v2 validation, error responses, `Idempotency-Key` và `X-Request-ID`. | [`docs/api_spec.md`](./docs/api_spec.md) |
 | **4. Database & Data Persistence** | `1.0đ` | 4 PostgreSQL Databases độc lập với `CHECK (available_balance >= 0)`, `UNIQUE`, `FK`, `version` và tự động nạp Seed Data khi khởi chạy. | [`infra/postgres/init-multiple-dbs.sql`](./infra/postgres/init-multiple-dbs.sql) |
 | **5. Hiện thực chức năng & Payment Workflow** | `2.0đ` | Đăng nhập JWT, tra cứu học phí theo MSSV, khởi tạo thanh toán toàn bộ, sinh và gửi OTP (TTL 5 phút, dùng một lần), trừ tiền, gạch nợ, lưu lịch sử và gửi email biên lai. | `services/` |
-| **6. Transaction & Concurrency** | `1.5đ` | Không giữ row lock trong thời gian chờ OTP; dùng **pessimistic locking (`SELECT ... FOR UPDATE`)** khi xử lý giao dịch và Saga compensation khi phát hiện thanh toán trùng. | [`services/payment-service/app/routers/payments.py`](./services/payment-service/app/routers/payments.py) |
+| **6. Transaction & Concurrency** | `1.5đ` | Không giữ row lock trong thời gian chờ OTP; dùng Redis Distributed Lock + **pessimistic locking (`SELECT ... FOR UPDATE`)** khi xử lý giao dịch và Saga compensation khi phát hiện thanh toán trùng. | [`services/payment-service/app/routers/payments.py`](./services/payment-service/app/routers/payments.py) |
 | **7. User Interface & Integration** | `0.5đ` | Giao diện React 18 + Vite + Tailwind CSS hiện đại, tích hợp thật với Backend qua API Gateway. | `frontend/` |
-| **8. Documentation, Deployment & Demonstration** | `1.5đ` | Có hướng dẫn chạy bằng `docker-compose.yml` và bộ kiểm thử E2E cùng 2 kịch bản concurrency. | [`docker-compose.yml`](./docker-compose.yml), `tests/` |
+| **8. Documentation, Deployment & Demonstration** | `1.5đ` | Có hướng dẫn chạy bằng `docker-compose.yml` và bộ kiểm thử E2E, 2 kịch bản concurrency cùng các test biên/bảo mật. | [`docker-compose.yml`](./docker-compose.yml), `tests/` |
 
 ---
 
@@ -36,15 +36,15 @@ flowchart TB
         UI["React 18 + Vite + Tailwind CSS\n(Port: 5173)"]
     end
 
-    subgraph GatewayLayer["API Gateway Layer"]
-        GW["api-gateway (FastAPI Reverse Proxy)\nJWT Auth + X-Request-ID Tracing\n(Port: 8000)"]
+    subgraph GatewayLayer["API Gateway Layer (public_network + internal_network)"]
+        GW["api-gateway (FastAPI Reverse Proxy)\nJWT Auth + X-Request-ID + Internal Token\n(Port: 8000)"]
     end
 
-    subgraph Services["Core Microservices Layer"]
-        AUTH["auth-account-service\n(Port: 8001)"]
-        TUITION["tuition-service\n(Port: 8002)"]
-        PAYMENT["payment-service\nSaga Orchestrator & Idempotency\n(Port: 8003)"]
-        OTP["notification-otp-service\nOTP Lua & SMTP Mailer\n(Port: 8004)"]
+    subgraph Services["Core Microservices Layer (internal_network - expose only)"]
+        AUTH["auth-account-service\n(Internal Port: 8001)"]
+        TUITION["tuition-service\n(Internal Port: 8002)"]
+        PAYMENT["payment-service\nSaga Orchestrator & Idempotency\n(Internal Port: 8003)"]
+        OTP["notification-otp-service\nOTP Lua & SMTP Mailer\n(Internal Port: 8004)"]
     end
 
     subgraph DataLayer["Data Persistence Layer (Database-per-Service)"]
@@ -52,7 +52,7 @@ flowchart TB
         DB_TUI[("tuition_db\n(PostgreSQL 16)")]
         DB_PAY[("payment_db\n(PostgreSQL 16)")]
         DB_NOTIF[("notification_db\n(PostgreSQL 16)")]
-        REDIS[("Redis 7\nOTP TTL 300s & Lua")]
+        REDIS[("Redis 7\nOTP TTL 300s, Lua Lock & Cache")]
     end
 
     subgraph External["External Infrastructure"]
@@ -71,6 +71,7 @@ flowchart TB
     AUTH --> DB_ACC
     TUITION --> DB_TUI
     PAYMENT --> DB_PAY
+    PAYMENT -->|Distributed Lock & Idempotency| REDIS
     OTP --> DB_NOTIF
     OTP --> REDIS
     OTP -->|SMTP| MAILPIT
@@ -79,13 +80,13 @@ flowchart TB
 ### Giải thích thiết kế concurrency và Saga:
 1. **Không giữ Database Row Lock trong 5 phút chờ nhập OTP:**
    - Bước khởi tạo (`POST /api/v1/payments/initiate`) chỉ thực hiện **pre-check đọc dữ liệu** (kiểm tra học phí tồn tại, đang `UNPAID`, và `available_balance >= amount`), tạo bản ghi `PENDING_OTP` và gửi mã OTP qua email.
-   - Khóa bi quan **`SELECT ... FOR UPDATE`** được kích hoạt khi người dùng xác thực mã OTP (`POST /api/v1/payments/{id}/confirm-otp`), thay vì giữ khóa trong thời gian chờ nhập OTP.
+   - Khóa bi quan **`SELECT ... FOR UPDATE`** (kết hợp Redis Distributed Lock `lock:account` & `lock:tuition`) chỉ được kích hoạt khi người dùng xác thực mã OTP (`POST /api/v1/payments/{id}/confirm-otp`), thay vì giữ khóa trong thời gian chờ nhập OTP.
 2. **Xử lý Concurrency 1 (Nhiều giao dịch đồng thời trên cùng 1 tài khoản):**
    - `auth-account-service` thực thi `SELECT ... FROM users_accounts WHERE id = :id FOR UPDATE` trong transaction trừ tiền, kết hợp kiểm tra `available_balance >= amount` và ràng buộc `CHECK (available_balance >= 0)`. Giao dịch đến sau khi số dư không còn đủ sẽ bị từ chối (`409 Conflict - INSUFFICIENT_BALANCE`).
 3. **Xử lý Concurrency 2 (Nhiều tài khoản cùng thanh toán cho 1 MSSV):**
    - `tuition-service` thực thi `SELECT ... FROM tuition_bills WHERE id = :id FOR UPDATE` và chỉ cho phép chuyển trạng thái khi `status == 'UNPAID'`.
    - Chỉ một giao dịch gạch nợ thành công (`200 OK`). Giao dịch thứ hai nhận `409 Conflict`.
-   - Khi nhận mã `409` từ `tuition-service`, **Saga Orchestrator (`payment-service`) gọi Compensating API (`POST /internal/accounts/refund`)** để hoàn trả số tiền đã trừ và ghi nhận trạng thái `COMPENSATED`.
+   - Khi nhận lỗi gạch nợ sau khi đã trừ tiền, **Saga Orchestrator (`payment-service`) gọi Compensating API (`POST /internal/accounts/refund`, retry tối đa 3 lần)** để hoàn trả số tiền đã trừ và ghi nhận trạng thái `COMPENSATED` (hoặc `COMPENSATION_FAILED` nếu hoàn tiền cũng lỗi sau 3 lần thử).
 
 ---
 
@@ -100,21 +101,23 @@ docker compose up --build -d
 ```
 
 ### Danh sách Cổng dịch vụ (Service Ports):
-| Thành phần | URL Truy cập | Mô tả |
+> **Lưu ý cô lập mạng nội bộ:** Toàn bộ REST API công khai & Swagger UI đi qua điểm truy cập duy nhất **API Gateway (`:8000`)**. Các port `8001–8004`, PostgreSQL (`5432`) và Redis (`6379`) chỉ được `expose` nội bộ trong Docker network (`internal_network`), **không mở công khai ra host**; các route `/internal/*` được bảo vệ bằng `X-Internal-Service-Token`.
+
+| Thành phần | URL / Endpoint | Mô tả |
 | :--- | :--- | :--- |
-| **Giao diện Web (Frontend)** | [http://localhost:5173](http://localhost:5173) | Giao diện người dùng TDTU iBanking (React + Vite + Tailwind CSS) |
-| **Hộp thư Email (Mailpit UI)** | [http://localhost:8025](http://localhost:8025) | Xem trực tiếp các Email chứa mã OTP và Email Biên lai xác nhận |
-| **API Gateway (Swagger UI)** | [http://localhost:8000/docs](http://localhost:8000/docs) | Cổng vào duy nhất cho mọi REST API (`/api/v1/*`) |
-| **Auth & Account Service** | [http://localhost:8001/docs](http://localhost:8001/docs) | Quản lý tài khoản, JWT & trừ/hoàn tiền nguyên tử |
-| **Tuition Service** | [http://localhost:8002/docs](http://localhost:8002/docs) | Quản lý sinh viên TDTU & gạch nợ học phí |
-| **Payment Service (Saga)** | [http://localhost:8003/docs](http://localhost:8003/docs) | Saga Orchestrator, Idempotency & Lịch sử giao dịch |
-| **Notification & OTP Service** | [http://localhost:8004/docs](http://localhost:8004/docs) | Sinh/Xác thực OTP trên Redis + PostgreSQL & gửi SMTP |
+| **Giao diện Web (Frontend)** | [http://localhost:5173](http://localhost:5173) *(Public)* | Giao diện người dùng TDTU iBanking (React + Vite + Tailwind CSS) |
+| **Hộp thư Email (Mailpit UI)** | [http://localhost:8025](http://localhost:8025) *(Public UI / Internal SMTP :1025)* | Xem trực tiếp các Email chứa mã OTP và Email Biên lai xác nhận |
+| **API Gateway (Swagger UI)** | [http://localhost:8000/docs](http://localhost:8000/docs) *(Public)* | Cổng vào duy nhất & tài liệu Swagger tập trung cho mọi REST API (`/api/v1/*`) |
+| **Auth & Account Service** | `auth-account-service:8001` *(Cô lập nội bộ `internal_network`)* | Quản lý tài khoản, JWT & trừ/hoàn tiền nguyên tử |
+| **Tuition Service** | `tuition-service:8002` *(Cô lập nội bộ `internal_network`)* | Quản lý sinh viên TDTU & gạch nợ học phí |
+| **Payment Service (Saga)** | `payment-service:8003` *(Cô lập nội bộ `internal_network`)* | Saga Orchestrator, Redis Lock/Idempotency & Lịch sử giao dịch |
+| **Notification & OTP Service** | `notification-otp-service:8004` *(Cô lập nội bộ `internal_network`)* | Sinh/Xác thực OTP trên Redis + PostgreSQL & gửi SMTP |
 
 ---
 
 ## 4. DỮ LIỆU MẪU TỰ ĐỘNG NẠP (SEED DATA)
 
-### 4.1. Danh sách Tài khoản Người dùng (`Mật khẩu mặc định: Password@123`)
+### 4.1. Danh sách Tài khoản Người dùng (`Mật khẩu phát triển mặc định: Password@123`)
 | Username | Password | Họ và tên | Email | Số dư khả dụng | Mục đích Kiểm thử / Demo |
 | :--- | :--- | :--- | :--- | ---: | :--- |
 | `524K0032` | `Password@123` | Trần Minh Nghĩa | `524k0032@student.tdtu.edu.vn` | `50,000,000 VNĐ` | Tài khoản thành viên nhóm phục vụ Demo trên lớp. |
@@ -139,9 +142,9 @@ docker compose up --build -d
 
 ---
 
-## 5. CHẠY BỘ KIỂM THỬ TỰ ĐỘNG (E2E & 2 KỊCH BẢN CONCURRENCY)
+## 5. CHẠY BỘ KIỂM THỬ TỰ ĐỘNG (E2E, CONCURRENCY & SECURITY)
 
-Sau khi các container Docker đã khởi chạy (`docker compose up -d`), có thể chạy bộ kiểm thử tự động cho luồng nghiệp vụ và hai tình huống concurrency:
+Sau khi các container Docker đã khởi chạy (`docker compose up -d`), có thể chạy bộ kiểm thử tự động:
 
 ```bash
 pip install -r tests/requirements.txt
@@ -152,7 +155,8 @@ Hoặc chạy bằng `pytest`:
 pytest tests/ -v -s
 ```
 
-Bộ kiểm thử gồm 3 kịch bản:
+Bộ kiểm thử gồm 4 module (8 test cases):
 1. **[`tests/test_e2e_workflow.py`](./tests/test_e2e_workflow.py):** Kiểm tra luồng E2E, `X-Request-ID`, `Idempotency-Key`, các quy tắc thanh toán, OTP một lần và Saga Step Logs.
 2. **[`tests/test_concurrency_same_account.py`](./tests/test_concurrency_same_account.py):** Gửi đồng thời hai lệnh `confirm-otp` cho cùng tài khoản `nguyenvana`, với hai khoản `14,500,000 VNĐ`. Kết quả mong đợi là một giao dịch `200 OK`, một giao dịch `409 INSUFFICIENT_BALANCE`, và số dư cuối cùng `10,500,000 VNĐ`.
 3. **[`tests/test_concurrency_same_tuition.py`](./tests/test_concurrency_same_tuition.py):** Gửi đồng thời hai lệnh `confirm-otp` từ `nguyenvana` và `tranvanb` cho MSSV `52200001`. Kết quả mong đợi là một giao dịch thành công, giao dịch còn lại được hoàn tiền bù trừ và chuyển sang trạng thái `COMPENSATED`.
+4. **[`tests/test_edge_cases_and_security.py`](./tests/test_edge_cases_and_security.py):** Kiểm tra cô lập mạng `internal_network`, chặn `403` các `/internal/*` thiếu/sai `X-Internal-Service-Token`, mailer trả `"FAILED"` khi lỗi SMTP, `COMPENSATION_FAILED` khi refund lỗi sau 3 lần retry, giữ `COMPLETED` kèm `receipt_email_sent=False` khi lỗi email biên lai, và Redis Lock/Idempotency cache.

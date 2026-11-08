@@ -16,8 +16,13 @@ export function generateUuid() {
 }
 
 export function formatCurrency(amount) {
-  if (amount === null || amount === undefined || isNaN(Number(amount))) {
-    return "0 VNĐ";
+  if (
+    amount === null ||
+    amount === undefined ||
+    amount === "" ||
+    !Number.isFinite(Number(amount))
+  ) {
+    return "—";
   }
   return `${Number(amount).toLocaleString("vi-VN")} VNĐ`;
 }
@@ -68,16 +73,21 @@ async function request(path, options = {}) {
   }
 
   if (!response.ok) {
-    const errObj = data?.error || {
-      code: `HTTP_${response.status}`,
-      message: data?.detail || "Đã xảy ra lỗi khi giao tiếp với hệ thống.",
-      details: null,
-      correlation_id: respCorrelationId,
-    };
+    const detailObj =
+      data?.detail && typeof data.detail === "object" ? data.detail : null;
+    const errObj = data?.error ||
+      detailObj || {
+        code: `HTTP_${response.status}`,
+        message:
+          (typeof data?.detail === "string" && data.detail) ||
+          "Đã xảy ra lỗi khi giao tiếp với hệ thống.",
+        details: null,
+        correlation_id: respCorrelationId,
+      };
     const error = new Error(errObj.message || "Lỗi xử lý yêu cầu");
     error.status = response.status;
-    error.code = errObj.code;
-    error.details = errObj.details;
+    error.code = errObj.code || `HTTP_${response.status}`;
+    error.details = errObj.details ?? null;
     error.correlationId = errObj.correlation_id || respCorrelationId;
     throw error;
   }

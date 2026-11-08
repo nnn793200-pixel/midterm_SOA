@@ -4,7 +4,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, Any
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -111,6 +111,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+def ensure_demo_endpoints_enabled() -> None:
+    if not settings.ENABLE_DEMO_ENDPOINTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "DEMO_ENDPOINTS_DISABLED",
+                "message": "Các endpoint phục vụ demo/kiểm thử đã bị tắt theo cấu hình hệ thống (ENABLE_DEMO_ENDPOINTS=false).",
+            },
+        )
+
+
 # ============================================================================
 # HEALTH & CLUSTER STATUS ENDPOINTS
 # ============================================================================
@@ -160,7 +171,11 @@ async def route_login(request: Request):
     return await forward_request(request, target_url)
 
 
-@app.get("/api/v1/accounts/demo-users", tags=["1. Auth & Account"])
+@app.get(
+    "/api/v1/accounts/demo-users",
+    tags=["1. Auth & Account"],
+    dependencies=[Depends(ensure_demo_endpoints_enabled)],
+)
 async def route_demo_users(request: Request):
     target_url = f"{settings.AUTH_ACCOUNT_SERVICE_URL}/accounts/demo-users"
     return await forward_request(request, target_url)
@@ -248,6 +263,7 @@ async def route_payment_detail(
 @app.get(
     "/api/v1/payments/{transaction_id}/demo-otp",
     tags=["3. Payment Workflow & Saga"],
+    dependencies=[Depends(ensure_demo_endpoints_enabled)],
 )
 async def route_payment_demo_otp(
     transaction_id: str,
@@ -260,7 +276,11 @@ async def route_payment_demo_otp(
     return await forward_request(request, target_url, jwt_claims=jwt_claims)
 
 
-@app.post("/api/v1/system/reset-demo", tags=["4. Demo & Test Reset"])
+@app.post(
+    "/api/v1/system/reset-demo",
+    tags=["4. Demo & Test Reset"],
+    dependencies=[Depends(ensure_demo_endpoints_enabled)],
+)
 async def route_reset_demo_system(request: Request):
     """
     Khôi phục toàn bộ dữ liệu mẫu trên cả 4 Microservices phục vụ chạy Automated Tests & Demo.

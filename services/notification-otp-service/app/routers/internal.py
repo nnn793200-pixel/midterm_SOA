@@ -110,7 +110,12 @@ def generate_and_send_otp(
         html_body=html_body,
     )
 
-    # 5. Lưu bản ghi NotificationLog
+    # 5. Nếu gửi SMTP OTP thất bại -> vô hiệu hóa OtpToken trong DB (đồng bộ với xóa Redis)
+    if delivery_status != "SENT":
+        otp_record.is_used = True
+        otp_record.used_at = now
+
+    # 6. Lưu bản ghi NotificationLog
     notif_log = NotificationLog(
         transaction_id=payload.transaction_id,
         otp_token_id=otp_record.id,

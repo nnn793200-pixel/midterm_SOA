@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
@@ -47,6 +48,23 @@ def generate_transaction_code() -> str:
     now_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     rand_digits = f"{secrets.SystemRandom().randint(100000, 999999)}"
     return f"TXN-{now_str}-{rand_digits}"
+
+
+def build_error_envelope(
+    code: str,
+    message: str,
+    correlation_id: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+            "correlation_id": correlation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    }
 
 
 @router.post(
@@ -163,122 +181,144 @@ def initiate_payment(
             },
         )
 
-    # 5. Khởi tạo bản ghi giao dịch ở trạng thái PENDING_OTP
+    # 5. Khởi tạo bản ghi giao dịch ở trạng thái PENDING_OTP & xử lý cạnh tranh Idempotency-Key đồng thời
     now = datetime.now(timezone.utc)
     otp_expires_at = now + timedelta(seconds=settings.OTP_TTL_SECONDS)
     tx_code = generate_transaction_code()
 
-    tx = PaymentTransaction(
-        transaction_code=tx_code,
-        payer_account_id=payer_uuid,
-        payer_full_name=account_data["full_name"],
-        payer_phone=account_data["phone_number"],
-        payer_email=account_data["email"],
-        student_id=student_data["student_id"],
-        student_full_name=student_data["full_name"],
-        tuition_bill_id=uuid.UUID(str(bill_data["id"])),
-        semester_code=bill_data["semester_code"],
-        semester_name=bill_data["semester_name"],
-        amount=bill_amount,
-        terms_accepted=True,
-        status="PENDING_OTP",
-        idempotency_key=clean_idem_key,
-        correlation_id=correlation_id,
-        otp_expires_at=otp_expires_at,
-        version=1,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(tx)
-    db.flush()
+    try:
+        tx = PaymentTransaction(
+            transaction_code=tx_code,
+            payer_account_id=payer_uuid,
+            payer_full_name=account_data["full_name"],
+            payer_phone=account_data["phone_number"],
+            payer_email=account_data["email"],
+            student_id=student_data["student_id"],
+            student_full_name=student_data["full_name"],
+            tuition_bill_id=uuid.UUID(str(bill_data["id"])),
+            semester_code=bill_data["semester_code"],
+            semester_name=bill_data["semester_name"],
+            amount=bill_amount,
+            terms_accepted=True,
+            status="PENDING_OTP",
+            idempotency_key=clean_idem_key,
+            correlation_id=correlation_id,
+            otp_expires_at=otp_expires_at,
+            version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(tx)
+        db.flush()
 
-    append_saga_step(
-        db=db,
-        transaction_id=tx.id,
-        step_order=1,
-        step_name="PRECHECK_ACCOUNT",
-        target_service="auth-account-service",
-        step_status="SUCCESS",
-        detail_payload={"available_balance": float(available_balance)},
-    )
-    append_saga_step(
-        db=db,
-        transaction_id=tx.id,
-        step_order=2,
-        step_name="PRECHECK_TUITION",
-        target_service="tuition-service",
-        step_status="SUCCESS",
-        detail_payload={
-            "student_id": tx.student_id,
-            "tuition_status": bill_data["status"],
-            "amount": float(bill_amount),
-        },
-    )
+        append_saga_step(
+            db=db,
+            transaction_id=tx.id,
+            step_order=1,
+            step_name="PRECHECK_ACCOUNT",
+            target_service="auth-account-service",
+            step_status="SUCCESS",
+            detail_payload={"available_balance": float(available_balance)},
+        )
+        append_saga_step(
+            db=db,
+            transaction_id=tx.id,
+            step_order=2,
+            step_name="PRECHECK_TUITION",
+            target_service="tuition-service",
+            step_status="SUCCESS",
+            detail_payload={
+                "student_id": tx.student_id,
+                "tuition_status": bill_data["status"],
+                "amount": float(bill_amount),
+            },
+        )
 
-    # 6. Yêu cầu notification-otp-service sinh OTP (TTL 5 phút, không trùng lặp) & gửi Email
-    otp_resp = call_generate_otp(
-        payload={
-            "transaction_id": str(tx.id),
-            "transaction_code": tx.transaction_code,
-            "recipient_email": tx.payer_email,
-            "payer_name": tx.payer_full_name,
-            "student_id": tx.student_id,
-            "student_name": tx.student_full_name,
-            "semester_name": tx.semester_name,
-            "amount": float(tx.amount),
-        },
-        correlation_id=correlation_id,
-    )
+        # 6. Yêu cầu notification-otp-service sinh OTP (TTL 5 phút, không trùng lặp) & gửi Email
+        otp_resp = call_generate_otp(
+            payload={
+                "transaction_id": str(tx.id),
+                "transaction_code": tx.transaction_code,
+                "recipient_email": tx.payer_email,
+                "payer_name": tx.payer_full_name,
+                "student_id": tx.student_id,
+                "student_name": tx.student_full_name,
+                "semester_name": tx.semester_name,
+                "amount": float(tx.amount),
+            },
+            correlation_id=correlation_id,
+        )
 
-    append_saga_step(
-        db=db,
-        transaction_id=tx.id,
-        step_order=3,
-        step_name="GENERATE_AND_SEND_OTP",
-        target_service="notification-otp-service",
-        step_status="SUCCESS",
-        detail_payload=otp_resp,
-    )
+        append_saga_step(
+            db=db,
+            transaction_id=tx.id,
+            step_order=3,
+            step_name="GENERATE_AND_SEND_OTP",
+            target_service="notification-otp-service",
+            step_status="SUCCESS",
+            detail_payload=otp_resp,
+        )
 
-    response_obj = InitiatePaymentResponse(
-        transaction_id=tx.id,
-        transaction_code=tx.transaction_code,
-        status=tx.status,
-        payer=PayerSummarySchema(
-            account_id=tx.payer_account_id,
-            full_name=tx.payer_full_name,
-            phone_number=tx.payer_phone,
-            email=tx.payer_email,
-            balance_before=float(available_balance),
-        ),
-        tuition=TuitionSummarySchema(
-            tuition_bill_id=tx.tuition_bill_id,
-            student_id=tx.student_id,
-            student_full_name=tx.student_full_name,
-            semester_code=tx.semester_code,
-            semester_name=tx.semester_name,
-            amount=float(tx.amount),
-            tuition_status="UNPAID",
-        ),
-        otp_info=OtpInfoSchema(
-            sent_to_email=tx.payer_email,
-            expires_in_seconds=otp_resp["expires_in_seconds"],
-            expires_at=tx.otp_expires_at,
-        ),
-        message="Mã OTP đã được gửi đến địa chỉ email của người nộp tiền. Mã có hiệu lực tối đa 5 phút.",
-    )
+        response_obj = InitiatePaymentResponse(
+            transaction_id=tx.id,
+            transaction_code=tx.transaction_code,
+            status=tx.status,
+            payer=PayerSummarySchema(
+                account_id=tx.payer_account_id,
+                full_name=tx.payer_full_name,
+                phone_number=tx.payer_phone,
+                email=tx.payer_email,
+                balance_before=float(available_balance),
+            ),
+            tuition=TuitionSummarySchema(
+                tuition_bill_id=tx.tuition_bill_id,
+                student_id=tx.student_id,
+                student_full_name=tx.student_full_name,
+                semester_code=tx.semester_code,
+                semester_name=tx.semester_name,
+                amount=float(tx.amount),
+                tuition_status="UNPAID",
+            ),
+            otp_info=OtpInfoSchema(
+                sent_to_email=tx.payer_email,
+                expires_in_seconds=otp_resp["expires_in_seconds"],
+                expires_at=tx.otp_expires_at,
+            ),
+            message="Mã OTP đã được gửi đến địa chỉ email của người nộp tiền. Mã có hiệu lực tối đa 5 phút.",
+        )
 
-    save_idempotency(
-        db=db,
-        idempotency_key=clean_idem_key,
-        account_id=payer_uuid,
-        endpoint="POST:/payments/initiate",
-        payload_dict=payload_dict,
-        status_code=status.HTTP_201_CREATED,
-        response_body=response_obj.model_dump(mode="json"),
-    )
-
-    return response_obj
+        save_idempotency(
+            db=db,
+            idempotency_key=clean_idem_key,
+            account_id=payer_uuid,
+            endpoint="POST:/payments/initiate",
+            payload_dict=payload_dict,
+            status_code=status.HTTP_201_CREATED,
+            response_body=response_obj.model_dump(mode="json"),
+        )
+        return response_obj
+    except IntegrityError:
+        db.rollback()
+        cached_after_race = check_idempotency(
+            db=db,
+            idempotency_key=clean_idem_key,
+            account_id=payer_uuid,
+            endpoint="POST:/payments/initiate",
+            payload_dict=payload_dict,
+        )
+        if cached_after_race:
+            cached_status, cached_body = cached_after_race
+            return JSONResponse(status_code=cached_status, content=cached_body)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "CONCURRENT_IDEMPOTENCY_CONFLICT",
+                "message": "Giao dịch với Idempotency-Key này đang được xử lý đồng thời. Vui lòng thử lại sau giây lát.",
+            },
+        )
+    except HTTPException:
+        db.rollback()
+        raise
 
 
 @router.post(
@@ -493,6 +533,29 @@ def confirm_otp_and_execute_saga(
             tx.completed_at = datetime.now(timezone.utc)
             tx.version = tx.version + 1
             db.commit()
+
+            if debit_resp is not None and err_http_status in (400, 409):
+                err_body = build_error_envelope(
+                    code=debit_err["code"],
+                    message=debit_err["message"],
+                    correlation_id=correlation_id,
+                    details=debit_err.get("details"),
+                )
+                save_idempotency(
+                    db=db,
+                    idempotency_key=clean_idem_key,
+                    account_id=payer_uuid,
+                    endpoint=f"POST:/payments/{transaction_id}/confirm-otp",
+                    payload_dict=payload_dict,
+                    status_code=err_http_status,
+                    response_body=err_body,
+                )
+                return JSONResponse(
+                    status_code=err_http_status,
+                    headers={"X-Request-ID": correlation_id},
+                    content=err_body,
+                )
+
             raise HTTPException(
                 status_code=err_http_status,
                 detail=debit_err,
@@ -641,20 +704,33 @@ def confirm_otp_and_execute_saga(
                 tx.updated_at = compensated_time
                 db.commit()
 
-                raise HTTPException(
+                comp_details = {
+                    "transaction_id": str(tx.id),
+                    "transaction_code": tx.transaction_code,
+                    "status": "COMPENSATED",
+                    "student_id": tx.student_id,
+                    "refunded_amount": float(tx.amount),
+                    "restored_balance": restored_balance,
+                }
+                comp_body = build_error_envelope(
+                    code=err_code,
+                    message=tx.failure_reason,
+                    correlation_id=correlation_id,
+                    details=comp_details,
+                )
+                save_idempotency(
+                    db=db,
+                    idempotency_key=clean_idem_key,
+                    account_id=payer_uuid,
+                    endpoint=f"POST:/payments/{transaction_id}/confirm-otp",
+                    payload_dict=payload_dict,
                     status_code=http_status,
-                    detail={
-                        "code": err_code,
-                        "message": tx.failure_reason,
-                        "details": {
-                            "transaction_id": str(tx.id),
-                            "transaction_code": tx.transaction_code,
-                            "status": "COMPENSATED",
-                            "student_id": tx.student_id,
-                            "refunded_amount": float(tx.amount),
-                            "restored_balance": restored_balance,
-                        },
-                    },
+                    response_body=comp_body,
+                )
+                return JSONResponse(
+                    status_code=http_status,
+                    headers={"X-Request-ID": correlation_id},
+                    content=comp_body,
                 )
 
             # Hoàn tiền THẤT BẠI sau các lần retry -> COMPENSATION_FAILED (TUYỆT ĐỐI KHÔNG fake COMPENSATED)
@@ -684,21 +760,34 @@ def confirm_otp_and_execute_saga(
             tx.updated_at = failed_time
             db.commit()
 
-            raise HTTPException(
+            comp_fail_details = {
+                "transaction_id": str(tx.id),
+                "transaction_code": tx.transaction_code,
+                "status": "COMPENSATION_FAILED",
+                "student_id": tx.student_id,
+                "refund_error": refund_data,
+                "restored_balance": restored_balance,
+                "manual_reconciliation_required": True,
+            }
+            comp_fail_body = build_error_envelope(
+                code="COMPENSATION_FAILED",
+                message=comp_fail_msg,
+                correlation_id=correlation_id,
+                details=comp_fail_details,
+            )
+            save_idempotency(
+                db=db,
+                idempotency_key=clean_idem_key,
+                account_id=payer_uuid,
+                endpoint=f"POST:/payments/{transaction_id}/confirm-otp",
+                payload_dict=payload_dict,
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "code": "COMPENSATION_FAILED",
-                    "message": comp_fail_msg,
-                    "details": {
-                        "transaction_id": str(tx.id),
-                        "transaction_code": tx.transaction_code,
-                        "status": "COMPENSATION_FAILED",
-                        "student_id": tx.student_id,
-                        "refund_error": refund_data,
-                        "restored_balance": restored_balance,
-                        "manual_reconciliation_required": True,
-                    },
-                },
+                response_body=comp_fail_body,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                headers={"X-Request-ID": correlation_id},
+                content=comp_fail_body,
             )
 
         # 6. Giao dịch tài chính thành công trọn vẹn -> Commit COMPLETED NGAY LẬP TỨC trước khi gửi Email biên lai
@@ -830,7 +919,8 @@ def confirm_otp_and_execute_saga(
     status_code=status.HTTP_200_OK,
 )
 def get_payment_history(
-    status_filter: Optional[str] = None,
+    status_param: Optional[str] = Query(default=None, alias="status"),
+    status_filter: Optional[str] = Query(default=None),
     limit: int = 50,
     offset: int = 0,
     current_user_id: str = Depends(get_current_user_id),
@@ -840,9 +930,10 @@ def get_payment_history(
     query = db.query(PaymentTransaction).filter(
         PaymentTransaction.payer_account_id == payer_uuid
     )
-    if status_filter:
+    effective_status = status_param or status_filter
+    if effective_status:
         query = query.filter(
-            PaymentTransaction.status == status_filter.strip().upper()
+            PaymentTransaction.status == effective_status.strip().upper()
         )
 
     total = query.count()
@@ -923,8 +1014,17 @@ def get_demo_otp_for_transaction(
 
     correlation_id = getattr(request.state, "correlation_id", str(uuid.uuid4()))
     url = f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/debug/{transaction_id}"
-    with httpx.Client(timeout=5.0) as client:
-        resp = client.get(url, headers=internal_headers(correlation_id))
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(url, headers=internal_headers(correlation_id))
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "NOTIFICATION_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối notification-otp-service để tra cứu OTP demo: {str(exc)}",
+            },
+        )
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
@@ -947,18 +1047,27 @@ def reset_all_demo_data(request: Request, db: Session = Depends(get_db)):
     clear_payment_redis_keys()
 
     hdrs = internal_headers(correlation_id)
-    with httpx.Client(timeout=10.0) as client:
-        r_acc = client.post(
-            f"{settings.AUTH_ACCOUNT_SERVICE_URL}/internal/accounts/reset-demo",
-            headers=hdrs,
-        )
-        r_tui = client.post(
-            f"{settings.TUITION_SERVICE_URL}/internal/tuitions/reset-demo",
-            headers=hdrs,
-        )
-        r_otp = client.post(
-            f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/reset-demo",
-            headers=hdrs,
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r_acc = client.post(
+                f"{settings.AUTH_ACCOUNT_SERVICE_URL}/internal/accounts/reset-demo",
+                headers=hdrs,
+            )
+            r_tui = client.post(
+                f"{settings.TUITION_SERVICE_URL}/internal/tuitions/reset-demo",
+                headers=hdrs,
+            )
+            r_otp = client.post(
+                f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/reset-demo",
+                headers=hdrs,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "DOWNSTREAM_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối tới microservice nội bộ khi reset dữ liệu mẫu: {str(exc)}",
+            },
         )
 
     for svc_name, resp in (

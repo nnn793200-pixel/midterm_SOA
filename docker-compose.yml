@@ -189,6 +189,7 @@ services:
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+      ENABLE_DEMO_ENDPOINTS: ${ENABLE_DEMO_ENDPOINTS:-true}
       AUTH_ACCOUNT_SERVICE_URL: ${AUTH_ACCOUNT_SERVICE_URL:-http://auth-account-service:8001}
       TUITION_SERVICE_URL: ${TUITION_SERVICE_URL:-http://tuition-service:8002}
       PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL:-http://payment-service:8003}
