@@ -14,8 +14,13 @@ from app.schemas import (
     RefundAccountResponse,
 )
 from app.seed import seed_accounts
+from app.security import verify_internal_service_token
 
-router = APIRouter(prefix="/internal/accounts", tags=["Internal Account Operations"])
+router = APIRouter(
+    prefix="/internal/accounts",
+    tags=["Internal Account Operations"],
+    dependencies=[Depends(verify_internal_service_token)],
+)
 
 
 @router.get(

@@ -23,8 +23,13 @@ from app.mailer import (
     build_receipt_email_html,
     send_html_email,
 )
+from app.security import verify_internal_service_token
 
-router = APIRouter(prefix="/internal", tags=["Internal OTP & Notification Operations"])
+router = APIRouter(
+    prefix="/internal",
+    tags=["Internal OTP & Notification Operations"],
+    dependencies=[Depends(verify_internal_service_token)],
+)
 
 
 @router.post(
@@ -120,6 +125,23 @@ def generate_and_send_otp(
     db.add(notif_log)
     db.commit()
     db.refresh(otp_record)
+
+    if delivery_status != "SENT":
+        r = get_redis()
+        r.delete(f"otp:active_code:{otp_code}")
+        r.delete(f"otp:tx:{payload.transaction_id}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "OTP_EMAIL_DELIVERY_FAILED",
+                "message": "Không thể gửi email chứa mã OTP qua máy chủ SMTP.",
+                "details": {
+                    "delivery_status": delivery_status,
+                    "smtp_response": smtp_resp,
+                    "notification_log_id": str(notif_log.id),
+                },
+            },
+        )
 
     return GenerateOtpResponse(
         otp_token_id=otp_record.id,

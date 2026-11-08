@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from app.config import settings
 from app.database import engine, Base
 from app.routers import payments
@@ -18,10 +19,44 @@ logging.basicConfig(
 logger = logging.getLogger(settings.SERVICE_NAME)
 
 
+def sync_enum_check_constraints() -> None:
+    """
+    Cập nhật CHECK constraints trên PostgreSQL hiện có một cách idempotent
+    để bổ sung trạng thái COMPENSATION_FAILED khi nâng cấp schema không xóa volume.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE payment_transactions DROP CONSTRAINT IF EXISTS chk_payment_tx_status"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE payment_transactions ADD CONSTRAINT chk_payment_tx_status "
+                "CHECK (status IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED', 'EXPIRED'))"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE saga_step_logs DROP CONSTRAINT IF EXISTS chk_saga_step_status"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE saga_step_logs ADD CONSTRAINT chk_saga_step_status "
+                "CHECK (step_status IN ('SUCCESS', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED'))"
+            )
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing database schema for %s...", settings.SERVICE_NAME)
     Base.metadata.create_all(bind=engine)
+    try:
+        sync_enum_check_constraints()
+    except Exception as exc:
+        logger.warning("Check constraint sync skipped/warning: %s", str(exc))
     yield
 
 
@@ -34,7 +69,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

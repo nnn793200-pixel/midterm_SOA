@@ -13,8 +13,13 @@ from app.schemas import (
     MarkTuitionPaidResponse,
 )
 from app.seed import seed_tuitions
+from app.security import verify_internal_service_token
 
-router = APIRouter(prefix="/internal/tuitions", tags=["Internal Tuition Operations"])
+router = APIRouter(
+    prefix="/internal/tuitions",
+    tags=["Internal Tuition Operations"],
+    dependencies=[Depends(verify_internal_service_token)],
+)
 
 
 @router.get(

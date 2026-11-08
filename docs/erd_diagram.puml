@@ -111,7 +111,7 @@ package "Phân vùng 3: payment-service [Saga Orchestrator] (PostgreSQL: payment
         * semester_code : VARCHAR(20) <<NOT NULL>>
         * **amount** : NUMERIC(15, 2) <<NOT NULL, CHECK (amount > 0)>>
         * **terms_accepted** : BOOLEAN <<NOT NULL, CHECK (terms_accepted = TRUE)>>
-        * **status** : VARCHAR(30) <<NOT NULL, CHECK IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'EXPIRED')>>
+        * **status** : VARCHAR(30) <<NOT NULL, CHECK IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED', 'EXPIRED')>>
         * failure_reason : VARCHAR(255) <<NULLABLE>>
         * **idempotency_key** : VARCHAR(100) <<UNIQUE, NOT NULL>>
         * correlation_id : VARCHAR(64) <<NOT NULL, INDEX>>
@@ -127,9 +127,9 @@ package "Phân vùng 3: payment-service [Saga Orchestrator] (PostgreSQL: payment
         --
         * **transaction_id** : UUID <<FK -> payment_transactions.id, NOT NULL, INDEX>>
         * step_order : INTEGER <<NOT NULL>>
-        * step_name : VARCHAR(50) <<NOT NULL, e.g., VERIFY_OTP, DEBIT_ACCOUNT, MARK_TUITION_PAID, COMPENSATE_REFUND, SEND_EMAIL>>
+        * step_name : VARCHAR(50) <<NOT NULL, e.g., VERIFY_OTP, DEBIT_ACCOUNT, MARK_TUITION_PAID, COMPENSATE_REFUND, SEND_RECEIPT_EMAIL, RECEIPT_EMAIL_FAILED>>
         * target_service : VARCHAR(50) <<NOT NULL>>
-        * step_status : VARCHAR(20) <<NOT NULL, CHECK IN ('SUCCESS', 'FAILED', 'COMPENSATED')>>
+        * step_status : VARCHAR(20) <<NOT NULL, CHECK IN ('SUCCESS', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED')>>
         * detail_payload : JSONB <<NULLABLE>>
         * error_message : TEXT <<NULLABLE>>
         * created_at : TIMESTAMPTZ <<NOT NULL, DEFAULT NOW()>>
@@ -202,19 +202,20 @@ payment_transactions ||..o{ account_ledger_entries : "Logical FK: transaction_id
 note bottom of tuition_bills
   **Chiến lược Concurrency 2 (Nhiều tài khoản đóng cùng 1 MSSV):**
   - Không khóa bản ghi trong 5 phút chờ nhập OTP.
-  - Ngay khi OTP được xác thực thành công:
-    Thực thi `SELECT ... FROM tuition_bills WHERE id = :id FOR UPDATE`
-    và `UPDATE tuition_bills SET status = 'PAID', paid_transaction_id = :tx_id, version = version + 1 WHERE id = :id AND status = 'UNPAID'`.
-  - Ràng buộc `paid_transaction_id UNIQUE` và kiểm tra `status = 'UNPAID'` đảm bảo
+  - Ngay khi OTP được xác thực thành công (bọc trong Redis lock `lock:tuition:{student_id}`):
+    Thực thi `SELECT ... FROM tuition_bills WHERE id = :id FOR UPDATE`,
+    kiểm tra `bill.status == 'UNPAID'` (nếu khác -> `409 TUITION_ALREADY_PAID`)
+    rồi cập nhật `status = 'PAID', paid_transaction_id = :tx_id, version = version + 1`.
+  - Ràng buộc `paid_transaction_id UNIQUE` và kiểm tra `status == 'UNPAID'` đảm bảo
     chỉ **DUY NHẤT 1 giao dịch** thanh toán thành công.
 end note
 
 note bottom of users_accounts
   **Chiến lược Concurrency 1 (Nhiều GD đồng thời trên 1 tài khoản):**
-  - Ngay khi OTP được xác thực thành công:
-    Thực thi `SELECT ... FROM users_accounts WHERE id = :id FOR UPDATE`
-    và `UPDATE users_accounts SET available_balance = available_balance - :amount, version = version + 1`
-    `WHERE id = :id AND available_balance >= :amount`.
+  - Ngay khi OTP được xác thực thành công (bọc trong Redis lock `lock:account:{user_id}`):
+    Thực thi `SELECT ... FROM users_accounts WHERE id = :id FOR UPDATE`,
+    kiểm tra `available_balance >= amount` (nếu thiếu -> `409 INSUFFICIENT_BALANCE`)
+    rồi trừ `available_balance` và tăng `version = version + 1`.
   - Kết hợp ràng buộc `CHECK (available_balance >= 0)` ngăn chặn tuyệt đối thấu chi.
 end note
 

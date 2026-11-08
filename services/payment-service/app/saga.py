@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple
@@ -10,8 +11,16 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import PaymentTransaction, SagaStepLog, IdempotencyRecord
+from app.redis_client import get_idempotency_from_redis, set_idempotency_in_redis
 
 logger = logging.getLogger(settings.SERVICE_NAME)
+
+
+def internal_headers(correlation_id: str) -> Dict[str, str]:
+    return {
+        "X-Request-ID": correlation_id,
+        "X-Internal-Service-Token": settings.INTERNAL_SERVICE_SECRET,
+    }
 
 
 def compute_request_hash(payload_dict: Dict[str, Any]) -> str:
@@ -26,6 +35,27 @@ def check_idempotency(
     endpoint: str,
     payload_dict: Dict[str, Any],
 ) -> Optional[Tuple[int, Dict[str, Any]]]:
+    req_hash = compute_request_hash(payload_dict)
+
+    # 1. Fast-path trên Redis Cache (idempotency:{key})
+    redis_cached = get_idempotency_from_redis(idempotency_key)
+    if redis_cached:
+        if (
+            redis_cached.get("account_id") != str(account_id)
+            or redis_cached.get("endpoint") != endpoint
+            or redis_cached.get("request_hash") != req_hash
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "IDEMPOTENCY_KEY_REUSED_MISMATCH",
+                    "message": "Idempotency-Key đã được sử dụng cho một yêu cầu khác.",
+                },
+            )
+        if redis_cached.get("status_code") and redis_cached.get("response_body"):
+            return int(redis_cached["status_code"]), redis_cached["response_body"]
+
+    # 2. Durable fallback trên PostgreSQL idempotency_records
     now = datetime.now(timezone.utc)
     record = (
         db.query(IdempotencyRecord)
@@ -40,8 +70,11 @@ def check_idempotency(
         db.commit()
         return None
 
-    req_hash = compute_request_hash(payload_dict)
-    if record.account_id != account_id or record.endpoint != endpoint or record.request_hash != req_hash:
+    if (
+        record.account_id != account_id
+        or record.endpoint != endpoint
+        or record.request_hash != req_hash
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -51,6 +84,18 @@ def check_idempotency(
         )
 
     if record.response_status_code and record.response_body:
+        ttl_remaining = max(int((record.expires_at - now).total_seconds()), 60)
+        set_idempotency_in_redis(
+            idempotency_key=idempotency_key,
+            payload={
+                "account_id": str(record.account_id),
+                "endpoint": record.endpoint,
+                "request_hash": record.request_hash,
+                "status_code": record.response_status_code,
+                "response_body": record.response_body,
+            },
+            ttl_seconds=ttl_remaining,
+        )
         return record.response_status_code, record.response_body
 
     return None
@@ -88,6 +133,18 @@ def save_idempotency(
         )
         db.add(record)
     db.commit()
+
+    set_idempotency_in_redis(
+        idempotency_key=idempotency_key,
+        payload={
+            "account_id": str(account_id),
+            "endpoint": endpoint,
+            "request_hash": req_hash,
+            "status_code": status_code,
+            "response_body": response_body,
+        },
+        ttl_seconds=86400,
+    )
 
 
 def append_saga_step(
@@ -134,8 +191,17 @@ def extract_downstream_error(resp: httpx.Response, default_code: str) -> Dict[st
 
 def call_precheck_account(account_id: UUID, correlation_id: str) -> Dict[str, Any]:
     url = f"{settings.AUTH_ACCOUNT_SERVICE_URL}/internal/accounts/{account_id}"
-    with httpx.Client(timeout=8.0) as client:
-        resp = client.get(url, headers={"X-Request-ID": correlation_id})
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url, headers=internal_headers(correlation_id))
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "AUTH_ACCOUNT_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối auth-account-service: {str(exc)}",
+            },
+        )
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
@@ -146,8 +212,17 @@ def call_precheck_account(account_id: UUID, correlation_id: str) -> Dict[str, An
 
 def call_precheck_tuition(student_id: str, correlation_id: str) -> Dict[str, Any]:
     url = f"{settings.TUITION_SERVICE_URL}/internal/tuitions/{student_id}"
-    with httpx.Client(timeout=8.0) as client:
-        resp = client.get(url, headers={"X-Request-ID": correlation_id})
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url, headers=internal_headers(correlation_id))
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "TUITION_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối tuition-service: {str(exc)}",
+            },
+        )
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
@@ -160,9 +235,18 @@ def call_generate_otp(
     payload: Dict[str, Any], correlation_id: str
 ) -> Dict[str, Any]:
     url = f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/generate"
-    with httpx.Client(timeout=10.0) as client:
-        resp = client.post(
-            url, json=payload, headers={"X-Request-ID": correlation_id}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url, json=payload, headers=internal_headers(correlation_id)
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "NOTIFICATION_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối notification-otp-service: {str(exc)}",
+            },
         )
     if resp.status_code not in (200, 201):
         raise HTTPException(
@@ -176,11 +260,20 @@ def call_verify_otp(
     transaction_id: UUID, otp_code: str, correlation_id: str
 ) -> Dict[str, Any]:
     url = f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/verify"
-    with httpx.Client(timeout=8.0) as client:
-        resp = client.post(
-            url,
-            json={"transaction_id": str(transaction_id), "otp_code": otp_code},
-            headers={"X-Request-ID": correlation_id},
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(
+                url,
+                json={"transaction_id": str(transaction_id), "otp_code": otp_code},
+                headers=internal_headers(correlation_id),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "NOTIFICATION_SERVICE_UNAVAILABLE",
+                "message": f"Không thể kết nối notification-otp-service: {str(exc)}",
+            },
         )
     if resp.status_code != 200:
         raise HTTPException(
@@ -209,7 +302,7 @@ def call_debit_account(
                 "idempotency_key": idempotency_key,
                 "description": description,
             },
-            headers={"X-Request-ID": correlation_id},
+            headers=internal_headers(correlation_id),
         )
 
 
@@ -232,7 +325,7 @@ def call_mark_tuition_paid(
                 "payer_account_id": str(payer_account_id),
                 "amount": float(amount),
             },
-            headers={"X-Request-ID": correlation_id},
+            headers=internal_headers(correlation_id),
         )
 
 
@@ -243,20 +336,58 @@ def call_refund_account_compensation(
     idempotency_key: str,
     reason: str,
     correlation_id: str,
+    max_attempts: int = 3,
 ) -> httpx.Response:
+    """
+    Gọi hoàn tiền bù trừ với cơ chế retry tối đa 3 lần (backoff ngắn).
+    """
     url = f"{settings.AUTH_ACCOUNT_SERVICE_URL}/internal/accounts/refund"
-    with httpx.Client(timeout=10.0) as client:
-        return client.post(
-            url,
-            json={
-                "account_id": str(account_id),
-                "transaction_id": str(transaction_id),
-                "amount": float(amount),
-                "idempotency_key": idempotency_key,
-                "reason": reason,
-            },
-            headers={"X-Request-ID": correlation_id},
-        )
+    backoff_seconds = [0.15, 0.35]
+    last_resp: Optional[httpx.Response] = None
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    url,
+                    json={
+                        "account_id": str(account_id),
+                        "transaction_id": str(transaction_id),
+                        "amount": float(amount),
+                        "idempotency_key": idempotency_key,
+                        "reason": reason,
+                    },
+                    headers=internal_headers(correlation_id),
+                )
+            last_resp = resp
+            if resp.status_code == 200:
+                return resp
+            logger.warning(
+                "Saga refund attempt %d/%d returned HTTP %d: %s",
+                attempt,
+                max_attempts,
+                resp.status_code,
+                resp.text[:200],
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Saga refund attempt %d/%d raised error: %s",
+                attempt,
+                max_attempts,
+                str(exc),
+            )
+
+        if attempt < max_attempts:
+            delay = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            time.sleep(delay)
+
+    if last_resp is not None:
+        return last_resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Saga compensation refund failed without HTTP response.")
 
 
 def call_send_receipt_email(
@@ -266,10 +397,20 @@ def call_send_receipt_email(
     try:
         with httpx.Client(timeout=8.0) as client:
             resp = client.post(
-                url, json=payload, headers={"X-Request-ID": correlation_id}
+                url, json=payload, headers=internal_headers(correlation_id)
             )
         if resp.status_code == 200:
             return resp.json()
+        logger.warning(
+            "Receipt email returned non-200 status %d: %s",
+            resp.status_code,
+            resp.text[:200],
+        )
+        return {
+            "delivery_status": "FAILED",
+            "http_status": resp.status_code,
+            "error": resp.text[:200],
+        }
     except Exception as exc:
         logger.warning("Receipt email notification warning: %s", str(exc))
-    return None
+        return None

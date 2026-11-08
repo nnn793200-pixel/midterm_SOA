@@ -1,6 +1,7 @@
 from typing import Dict, Any, Optional
 import httpx
 from fastapi import Request, Response, HTTPException, status
+from app.config import settings
 
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -30,6 +31,7 @@ async def forward_request(
 
     headers: Dict[str, str] = {
         "X-Request-ID": correlation_id,
+        "X-Internal-Service-Token": settings.INTERNAL_SERVICE_SECRET,
     }
     if "authorization" in request.headers:
         headers["Authorization"] = request.headers["authorization"]

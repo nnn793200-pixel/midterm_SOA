@@ -171,11 +171,11 @@ def send_html_email(
         logger.info("Sent email to %s | Subject: %s", recipient_email, subject)
         return "SENT", f"250 OK via {settings.SMTP_HOST}:{settings.SMTP_PORT}"
     except Exception as exc:
-        logger.warning(
-            "SMTP delivery warning to %s (%s:%d): %s",
+        logger.error(
+            "SMTP delivery failed to %s (%s:%d): %s",
             recipient_email,
             settings.SMTP_HOST,
             settings.SMTP_PORT,
             str(exc),
         )
-        return "SENT", f"FALLBACK_LOGGED ({str(exc)[:180]})"
+        return "FAILED", f"SMTP_ERROR: {str(exc)}"[:250]

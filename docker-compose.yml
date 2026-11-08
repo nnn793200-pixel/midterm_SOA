@@ -7,31 +7,31 @@ services:
     container_name: ibanking-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: postgres
-    ports:
-      - "5432:5432"
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init-multiple-dbs.sql:/docker-entrypoint-initdb.d/init-multiple-dbs.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 10
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 2. REDIS 7 (Lưu trữ OTP TTL 300s, Lua One-Time Verify & Distributed Lock)
+  # 2. REDIS 7 (OTP TTL 300s, Lua Verify, Distributed Lock & Idempotency Cache)
   # ==========================================================================
   redis:
     image: redis:7-alpine
     container_name: ibanking-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -41,23 +41,25 @@ services:
       timeout: 3s
       retries: 10
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 3. MAILPIT (SMTP Server cổng 1025 & Giao diện Web xem Email cổng 8025)
+  # 3. MAILPIT (SMTP nội bộ 1025 & Giao diện Web xem Email cổng 8025)
   # ==========================================================================
   mailpit:
     image: axllent/mailpit:latest
     container_name: ibanking-mailpit
     restart: unless-stopped
+    expose:
+      - "1025"
     ports:
-      - "1025:1025"
       - "8025:8025"
     networks:
-      - ibanking-net
+      - public_network
+      - internal_network
 
   # ==========================================================================
-  # 4. MICROSERVICE 1: auth-account-service (Port 8001 -> account_db)
+  # 4. MICROSERVICE 1: auth-account-service (Port 8001 nội bộ -> account_db)
   # ==========================================================================
   auth-account-service:
     build:
@@ -67,20 +69,22 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_NAME: auth-account-service
-      ACCOUNT_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/account_db
-      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
-      JWT_ALGORITHM: HS256
-      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
-    ports:
-      - "8001:8001"
+      ACCOUNT_DATABASE_URL: ${ACCOUNT_DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/account_db}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-tdtu-soa-2026-super-secret-jwt-key-9999}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+    expose:
+      - "8001"
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 5. MICROSERVICE 2: tuition-service (Port 8002 -> tuition_db)
+  # 5. MICROSERVICE 2: tuition-service (Port 8002 nội bộ -> tuition_db)
   # ==========================================================================
   tuition-service:
     build:
@@ -90,17 +94,19 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_NAME: tuition-service
-      TUITION_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/tuition_db
-    ports:
-      - "8002:8002"
+      TUITION_DATABASE_URL: ${TUITION_DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/tuition_db}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+    expose:
+      - "8002"
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 6. MICROSERVICE 4: notification-otp-service (Port 8004 -> notification_db + Redis + Mailpit)
+  # 6. MICROSERVICE 4: notification-otp-service (Port 8004 nội bộ -> notification_db + Redis + Mailpit)
   # ==========================================================================
   notification-otp-service:
     build:
@@ -110,15 +116,17 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_NAME: notification-otp-service
-      NOTIFICATION_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/notification_db
-      REDIS_URL: redis://redis:6379/0
-      OTP_TTL_SECONDS: 300
-      SMTP_HOST: mailpit
-      SMTP_PORT: 1025
-      SMTP_FROM_EMAIL: ibanking-noreply@tdtu.edu.vn
-      SMTP_FROM_NAME: TDTU iBanking System
-    ports:
-      - "8004:8004"
+      NOTIFICATION_DATABASE_URL: ${NOTIFICATION_DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/notification_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-300}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-ibanking-noreply@tdtu.edu.vn}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-TDTU iBanking System}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+    expose:
+      - "8004"
     depends_on:
       postgres:
         condition: service_healthy
@@ -127,10 +135,10 @@ services:
       mailpit:
         condition: service_started
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 7. MICROSERVICE 3: payment-service [Saga Orchestrator] (Port 8003 -> payment_db)
+  # 7. MICROSERVICE 3: payment-service [Saga Orchestrator] (Port 8003 nội bộ -> payment_db + Redis)
   # ==========================================================================
   payment-service:
     build:
@@ -140,16 +148,18 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_NAME: payment-service
-      PAYMENT_DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/payment_db
-      REDIS_URL: redis://redis:6379/0
-      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
-      JWT_ALGORITHM: HS256
-      OTP_TTL_SECONDS: 300
-      AUTH_ACCOUNT_SERVICE_URL: http://auth-account-service:8001
-      TUITION_SERVICE_URL: http://tuition-service:8002
-      NOTIFICATION_OTP_SERVICE_URL: http://notification-otp-service:8004
-    ports:
-      - "8003:8003"
+      PAYMENT_DATABASE_URL: ${PAYMENT_DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/payment_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-tdtu-soa-2026-super-secret-jwt-key-9999}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-300}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+      AUTH_ACCOUNT_SERVICE_URL: ${AUTH_ACCOUNT_SERVICE_URL:-http://auth-account-service:8001}
+      TUITION_SERVICE_URL: ${TUITION_SERVICE_URL:-http://tuition-service:8002}
+      NOTIFICATION_OTP_SERVICE_URL: ${NOTIFICATION_OTP_SERVICE_URL:-http://notification-otp-service:8004}
+    expose:
+      - "8003"
     depends_on:
       postgres:
         condition: service_healthy
@@ -162,10 +172,10 @@ services:
       notification-otp-service:
         condition: service_started
     networks:
-      - ibanking-net
+      - internal_network
 
   # ==========================================================================
-  # 8. API GATEWAY (Port 8000 -> Single Entry Point)
+  # 8. API GATEWAY (Port 8000 công khai -> Single Entry Point)
   # ==========================================================================
   api-gateway:
     build:
@@ -175,12 +185,14 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_NAME: api-gateway
-      JWT_SECRET_KEY: tdtu-soa-2026-super-secret-jwt-key-9999
-      JWT_ALGORITHM: HS256
-      AUTH_ACCOUNT_SERVICE_URL: http://auth-account-service:8001
-      TUITION_SERVICE_URL: http://tuition-service:8002
-      PAYMENT_SERVICE_URL: http://payment-service:8003
-      NOTIFICATION_OTP_SERVICE_URL: http://notification-otp-service:8004
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-tdtu-soa-2026-super-secret-jwt-key-9999}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000}
+      AUTH_ACCOUNT_SERVICE_URL: ${AUTH_ACCOUNT_SERVICE_URL:-http://auth-account-service:8001}
+      TUITION_SERVICE_URL: ${TUITION_SERVICE_URL:-http://tuition-service:8002}
+      PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL:-http://payment-service:8003}
+      NOTIFICATION_OTP_SERVICE_URL: ${NOTIFICATION_OTP_SERVICE_URL:-http://notification-otp-service:8004}
     ports:
       - "8000:8000"
     depends_on:
@@ -189,7 +201,8 @@ services:
       - payment-service
       - notification-otp-service
     networks:
-      - ibanking-net
+      - public_network
+      - internal_network
 
   # ==========================================================================
   # 9. FRONTEND WEB UI (React + Vite + Tailwind CSS -> Port 5173)
@@ -201,19 +214,22 @@ services:
     container_name: ibanking-frontend
     restart: unless-stopped
     environment:
-      VITE_API_GATEWAY_URL: http://localhost:8000/api/v1
-      VITE_MAILPIT_WEB_URL: http://localhost:8025
+      VITE_API_GATEWAY_URL: ${VITE_API_GATEWAY_URL:-http://localhost:8000/api/v1}
+      VITE_MAILPIT_WEB_URL: ${VITE_MAILPIT_WEB_URL:-http://localhost:8025}
     ports:
       - "5173:5173"
     depends_on:
       - api-gateway
     networks:
-      - ibanking-net
+      - public_network
 
 volumes:
   postgres_data:
   redis_data:
 
 networks:
-  ibanking-net:
+  public_network:
     driver: bridge
+  internal_network:
+    driver: bridge
+    internal: true

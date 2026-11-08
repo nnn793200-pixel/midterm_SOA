@@ -65,7 +65,7 @@ class PaymentTransaction(Base):
             "terms_accepted = TRUE", name="chk_payment_tx_terms_accepted"
         ),
         CheckConstraint(
-            "status IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'EXPIRED')",
+            "status IN ('PENDING_OTP', 'PROCESSING', 'COMPLETED', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED', 'EXPIRED')",
             name="chk_payment_tx_status",
         ),
     )
@@ -93,7 +93,7 @@ class SagaStepLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "step_status IN ('SUCCESS', 'FAILED', 'COMPENSATED')",
+            "step_status IN ('SUCCESS', 'FAILED', 'COMPENSATED', 'COMPENSATION_FAILED')",
             name="chk_saga_step_status",
         ),
     )
