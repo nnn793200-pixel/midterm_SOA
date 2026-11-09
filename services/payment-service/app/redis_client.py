@@ -34,7 +34,7 @@ def get_redis() -> redis.Redis:
 def acquire_distributed_lock(
     r: redis.Redis,
     lock_key: str,
-    ttl_ms: int = 15000,
+    ttl_ms: int = 60000,
     wait_timeout_s: float = 10.0,
 ) -> str:
     """
@@ -73,7 +73,7 @@ def release_distributed_lock(
 def acquire_payment_locks(
     account_id: str,
     student_id: str,
-    ttl_ms: int = 15000,
+    ttl_ms: int = 60000,
     wait_timeout_s: float = 10.0,
 ) -> Iterator[None]:
     """
@@ -90,7 +90,6 @@ def acquire_payment_locks(
     r = get_redis()
     account_token: Optional[str] = None
     tuition_token: Optional[str] = None
-    redis_available = True
 
     try:
         account_token = acquire_distributed_lock(
@@ -104,7 +103,6 @@ def acquire_payment_locks(
             release_distributed_lock(r, account_key, account_token)
         raise
     except redis.RedisError as exc:
-        redis_available = False
         logger.warning(
             "Redis distributed lock unavailable (%s); falling back to PostgreSQL row locks.",
             str(exc),
@@ -113,9 +111,8 @@ def acquire_payment_locks(
     try:
         yield
     finally:
-        if redis_available:
-            release_distributed_lock(r, tuition_key, tuition_token)
-            release_distributed_lock(r, account_key, account_token)
+        release_distributed_lock(r, tuition_key, tuition_token)
+        release_distributed_lock(r, account_key, account_token)
 
 
 def get_idempotency_from_redis(idempotency_key: str) -> Optional[Dict[str, Any]]:
