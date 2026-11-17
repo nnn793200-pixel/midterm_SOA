@@ -145,10 +145,17 @@ class _FakeQuery:
                 right = getattr(crit, "right", None)
                 attr_name = getattr(left, "key", None)
                 expected_val = getattr(right, "value", None)
+                op_name = getattr(getattr(crit, "operator", None), "__name__", "")
                 if attr_name and expected_val is not None and hasattr(obj, attr_name):
-                    if getattr(obj, attr_name) != expected_val:
-                        matched = False
-                        break
+                    actual_val = getattr(obj, attr_name)
+                    if op_name == "in_op":
+                        if actual_val not in expected_val:
+                            matched = False
+                            break
+                    elif op_name == "eq":
+                        if actual_val != expected_val:
+                            matched = False
+                            break
             if matched:
                 filtered.append(obj)
         self._all_objs = filtered
@@ -1017,7 +1024,7 @@ def test_payment_history_status_error_idempotency_and_request_errors() -> None:
             def _fake_save(db, idempotency_key, account_id, endpoint, payload_dict, status_code, response_body):
                 idem_cache[idempotency_key] = (status_code, response_body)
 
-            app.dependency_overrides[get_db] = lambda d=case_db: d
+            app.dependency_overrides[get_db] = (lambda s: (lambda: s))(case_db)
             idem_key = f"idem-{label}-{uuid.uuid4().hex[:8]}"
 
             patches = [
@@ -1170,6 +1177,278 @@ def test_payment_history_status_error_idempotency_and_request_errors() -> None:
         print("[✓] IntegrityError fallback trên /payments/initiate và 503 RequestError trên /demo-otp, /reset-demo hoạt động chính xác.")
 
 
+def test_checkout_lock_waiting_queue_unit() -> None:
+    """
+    Kiểm thử 8 (unit, mock Redis): hàng đợi chờ theo MSSV.
+    - initiate khi MSSV đang bị người khác giữ checkout_lock -> 202 WAITING_FOR_OTHER_PAYMENT, không gọi sinh OTP.
+    - tuition-status trả LOCKED / AVAILABLE / PAID đúng theo khoá Redis & trạng thái học phí.
+    - cancel giao dịch PENDING_OTP -> FAILED và gọi release_checkout_lock.
+    - Nhập sai OTP quá số lần -> giao dịch FAILED để giải phóng khoá.
+    """
+    print("\n" + "=" * 80)
+    print("TEST BIÊN 8: CHECKOUT LOCK - HÀNG ĐỢI CHỜ KHI 2 NGƯỜI CÙNG THANH TOÁN 1 MSSV")
+    print("=" * 80)
+
+    with _service_import_context("payment-service"):
+        from app.main import app
+        from app.database import get_db
+        from app.models import PaymentTransaction
+        from app.routers import payments as payments_router
+
+        payer_a = uuid.uuid4()
+        payer_b = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        bill_id = uuid.uuid4()
+
+        def _auth(uid):
+            return {"Authorization": f"Bearer {_make_jwt(str(uid))}"}
+
+        tuition_lookup = {
+            "student": {"student_id": "524K0033", "full_name": "Huỳnh Trung Tín"},
+            "tuition_bill": {
+                "id": str(bill_id),
+                "semester_code": "HK1_2026_2027",
+                "semester_name": "Học kỳ 1",
+                "amount": 15000000,
+                "status": "UNPAID",
+            },
+        }
+        account_b = {
+            "full_name": "Trần Thị Bình",
+            "phone_number": "0902345678",
+            "email": "524k0033@student.tdtu.edu.vn",
+            "available_balance": 30000000,
+        }
+
+        db = _FakePaymentDbSession(None)
+        app.dependency_overrides[get_db] = lambda: db
+        client = TestClient(app)
+        gen_otp = MagicMock()
+
+        with (
+            patch.object(payments_router, "check_idempotency", return_value=None),
+            patch.object(payments_router, "call_precheck_account", return_value=account_b),
+            patch.object(payments_router, "call_precheck_tuition", return_value=tuition_lookup),
+            patch.object(payments_router, "call_generate_otp", gen_otp),
+            patch.object(
+                payments_router,
+                "acquire_checkout_lock",
+                return_value={"transaction_id": str(uuid.uuid4()), "user_id": str(payer_a)},
+            ),
+        ):
+            resp = client.post(
+                "/payments/initiate",
+                headers={**_auth(payer_b), "Idempotency-Key": "wait-key-0001"},
+                json={
+                    "student_id": "524K0033",
+                    "tuition_bill_id": str(bill_id),
+                    "amount": 15000000,
+                    "terms_accepted": True,
+                },
+            )
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["status"] == "WAITING_FOR_OTHER_PAYMENT"
+        assert resp.json()["student_id"] == "524K0033"
+        assert gen_otp.call_count == 0, "Không được gửi OTP cho người đang phải chờ!"
+        print("[✓] initiate khi MSSV đang bị giữ chỗ: 202 WAITING_FOR_OTHER_PAYMENT, không sinh/gửi OTP.")
+
+        # tuition-status: LOCKED / AVAILABLE / PAID
+        def _status_with(lock, bill_status):
+            lookup = {
+                "student": tuition_lookup["student"],
+                "tuition_bill": {**tuition_lookup["tuition_bill"], "status": bill_status},
+            }
+            with (
+                patch.object(payments_router, "call_precheck_tuition", return_value=lookup),
+                patch.object(payments_router, "get_checkout_lock", return_value=lock),
+            ):
+                return client.get("/payments/tuition-status/524k0033", headers=_auth(payer_b)).json()
+
+        owner_a = {"transaction_id": str(uuid.uuid4()), "user_id": str(payer_a)}
+        assert _status_with(owner_a, "UNPAID")["state"] == "LOCKED"
+        assert _status_with(owner_a, "UNPAID")["locked_by_me"] is False
+        assert _status_with(None, "UNPAID")["state"] == "AVAILABLE"
+        assert _status_with(None, "PAID")["state"] == "PAID"
+        assert _status_with(owner_a, "PAID")["state"] == "PAID"
+        print("[✓] tuition-status trả đúng LOCKED / AVAILABLE / PAID.")
+
+        # cancel: PENDING_OTP -> FAILED + release_checkout_lock
+        tx = PaymentTransaction(
+            id=uuid.uuid4(),
+            transaction_code="TXN-20261117-111111",
+            payer_account_id=payer_a,
+            payer_full_name="Nguyễn Văn An",
+            payer_phone="0901234567",
+            payer_email="524k0032@student.tdtu.edu.vn",
+            student_id="524K0033",
+            student_full_name="Huỳnh Trung Tín",
+            tuition_bill_id=bill_id,
+            semester_code="HK1_2026_2027",
+            semester_name="Học kỳ 1",
+            amount=Decimal("15000000.00"),
+            terms_accepted=True,
+            status="PENDING_OTP",
+            idempotency_key="init-cancel-1",
+            correlation_id=str(uuid.uuid4()),
+            otp_expires_at=now + timedelta(minutes=5),
+            version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        cancel_db = _FakePaymentDbSession(tx)
+        app.dependency_overrides[get_db] = lambda: cancel_db
+        release_mock = MagicMock()
+        with patch.object(payments_router, "release_checkout_lock", release_mock):
+            r_cancel = client.post(f"/payments/{tx.id}/cancel", headers=_auth(payer_a))
+            r_other = client.post(f"/payments/{tx.id}/cancel", headers=_auth(payer_b))
+        app.dependency_overrides.clear()
+        assert r_cancel.status_code == 200 and r_cancel.json()["cancelled"] is True
+        assert tx.status == "FAILED"
+        release_mock.assert_called_with("524K0033", str(tx.id))
+        assert r_other.status_code == 404, "Người khác không được hủy giao dịch của A!"
+        print("[✓] cancel: PENDING_OTP -> FAILED, giải phóng checkout_lock; người lạ nhận 404.")
+
+
+def test_pending_resume_and_auto_expire_180s() -> None:
+    """
+    Kiểm thử 9:
+    - Cùng người dùng khởi tạo lại cho cùng MSSV khi còn PENDING_OTP < 180s -> trả lại đúng tx đang chờ (HTTP 200, không sinh OTP mới).
+    - Giao dịch PENDING_OTP quá 180s tự chuyển FAILED với thông báo quá 3 phút + ghi Saga step + giải phóng checkout_lock
+      khi gọi history, detail, tuition-status, initiate, và confirm-otp.
+    """
+    print("\n" + "=" * 80)
+    print("TEST BIÊN 9: GIỮ TRẠNG THÁI PENDING 3 PHÚT, THANH TOÁN TIẾP & AUTO-EXPIRE 180s -> FAILED")
+    print("=" * 80)
+
+    with _service_import_context("payment-service"):
+        from app.main import app
+        from app.database import get_db
+        from app.models import PaymentTransaction
+        from app.routers import payments as payments_router
+
+        payer_a = uuid.uuid4()
+        bill_id = uuid.uuid4()
+        auth_headers = {"Authorization": f"Bearer {_make_jwt(str(payer_a))}"}
+
+        def _make_pending_tx(age_seconds: int) -> PaymentTransaction:
+            created = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+            return PaymentTransaction(
+                id=uuid.uuid4(),
+                transaction_code=f"TXN-20261117-{uuid.uuid4().hex[:6].upper()}",
+                payer_account_id=payer_a,
+                payer_full_name="Nguyễn Văn An",
+                payer_phone="0901234567",
+                payer_email="524k0032@student.tdtu.edu.vn",
+                student_id="524K0033",
+                student_full_name="Huỳnh Trung Tín",
+                tuition_bill_id=bill_id,
+                semester_code="HK1_2026_2027",
+                semester_name="Học kỳ 1",
+                amount=Decimal("15000000.00"),
+                terms_accepted=True,
+                status="PENDING_OTP",
+                idempotency_key=f"init-{uuid.uuid4().hex}",
+                correlation_id=str(uuid.uuid4()),
+                otp_expires_at=created + timedelta(seconds=180),
+                version=1,
+                created_at=created,
+                updated_at=created,
+            )
+
+        tuition_lookup = {
+            "student": {"student_id": "524K0033", "full_name": "Huỳnh Trung Tín"},
+            "tuition_bill": {
+                "id": str(bill_id),
+                "semester_code": "HK1_2026_2027",
+                "semester_name": "Học kỳ 1",
+                "amount": 15000000,
+                "status": "UNPAID",
+            },
+        }
+        account_a = {
+            "full_name": "Nguyễn Văn An",
+            "phone_number": "0901234567",
+            "email": "524k0032@student.tdtu.edu.vn",
+            "available_balance": 25000000,
+        }
+
+        # 1. Cùng user bấm lại < 180s -> mở lại chính tx PENDING_OTP, không sinh OTP mới
+        tx_active = _make_pending_tx(age_seconds=45)
+        db_active = _FakePaymentDbSession(tx_active)
+        app.dependency_overrides[get_db] = lambda: db_active
+        client = TestClient(app)
+        gen_otp = MagicMock()
+        replace_mock = MagicMock()
+
+        with (
+            patch.object(payments_router, "check_idempotency", return_value=None),
+            patch.object(payments_router, "call_precheck_account", return_value=account_a),
+            patch.object(payments_router, "call_precheck_tuition", return_value=tuition_lookup),
+            patch.object(payments_router, "call_generate_otp", gen_otp),
+            patch.object(payments_router, "replace_checkout_lock", replace_mock),
+        ):
+            r_resume = client.post(
+                "/payments/initiate",
+                headers={**auth_headers, "Idempotency-Key": f"resume-{uuid.uuid4()}"},
+                json={
+                    "student_id": "524K0033",
+                    "tuition_bill_id": str(bill_id),
+                    "amount": 15000000,
+                    "terms_accepted": True,
+                },
+            )
+        app.dependency_overrides.clear()
+        assert r_resume.status_code == 200, r_resume.text
+        body_resume = r_resume.json()
+        assert body_resume["transaction_id"] == str(tx_active.id)
+        assert 120 <= body_resume["otp_info"]["expires_in_seconds"] <= 140
+        assert gen_otp.call_count == 0
+        print("[✓]initiate lại cùng MSSV khi PENDING < 180s: mở lại đúng giao dịch cũ, không gửi OTP mới.")
+
+        # 2. Auto-expire >= 180s trên history, tuition-status và confirm-otp
+        for endpoint_name in ("history", "tuition-status", "confirm-otp"):
+            tx_overdue = _make_pending_tx(age_seconds=185)
+            db_over = _FakePaymentDbSession(tx_overdue)
+            app.dependency_overrides[get_db] = (lambda s: (lambda: s))(db_over)
+            rel_mock = MagicMock()
+
+            with (
+                patch.object(payments_router, "release_checkout_lock", rel_mock),
+                patch.object(payments_router, "call_precheck_tuition", return_value=tuition_lookup),
+                patch.object(payments_router, "get_checkout_lock", return_value=None),
+                patch.object(payments_router, "check_idempotency", return_value=None),
+            ):
+                if endpoint_name == "history":
+                    resp = client.get("/payments/history", headers=auth_headers)
+                    assert resp.status_code == 200
+                    assert resp.json()["items"][0]["status"] == "FAILED"
+                elif endpoint_name == "tuition-status":
+                    resp = client.get("/payments/tuition-status/524K0033", headers=auth_headers)
+                    assert resp.status_code == 200
+                    assert resp.json()["state"] == "AVAILABLE"
+                else:
+                    @contextmanager
+                    def _noop_locks(**kwargs):
+                        yield
+
+                    with patch.object(payments_router, "acquire_payment_locks", _noop_locks):
+                        resp = client.post(
+                            f"/payments/{tx_overdue.id}/confirm-otp",
+                            headers={**auth_headers, "Idempotency-Key": f"exp-{uuid.uuid4()}"},
+                            json={"otp_code": "123456"},
+                        )
+                    assert resp.status_code == 400
+                    assert resp.json()["error"]["code"] == "OTP_EXPIRED"
+
+            app.dependency_overrides.clear()
+            assert tx_overdue.status == "FAILED"
+            assert "3 phút" in (tx_overdue.failure_reason or "")
+            assert any(s.step_name == "OTP_PENDING_TIMEOUT" and s.step_status == "FAILED" for s in db_over.steps)
+            rel_mock.assert_called_with("524K0033", str(tx_overdue.id))
+
+        print("[✓] Auto-expire >= 180s: cập nhật FAILED, ghi log OTP_PENDING_TIMEOUT & xóa checkout_lock.")
+
+
 def run_edge_cases_and_security_tests() -> None:
     test_internal_endpoints_require_token()
     test_mailer_returns_failed_on_smtp_error()
@@ -1178,6 +1457,8 @@ def run_edge_cases_and_security_tests() -> None:
     test_payment_redis_locks_and_idempotency()
     test_demo_endpoints_toggle_on_api_gateway()
     test_payment_history_status_error_idempotency_and_request_errors()
+    test_checkout_lock_waiting_queue_unit()
+    test_pending_resume_and_auto_expire_180s()
 
 
 if __name__ == "__main__":

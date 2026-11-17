@@ -134,6 +134,12 @@ export const api = {
 
   getPaymentHistory: () => request("/payments/history"),
 
+  cancelPayment: (transactionId) =>
+    request(`/payments/${transactionId}/cancel`, { method: "POST" }),
+
+  getTuitionPaymentStatus: (studentId) =>
+    request(`/payments/tuition-status/${encodeURIComponent(studentId.trim())}`),
+
   getTransactionDetail: (transactionId) =>
     request(`/payments/${transactionId}`),
 

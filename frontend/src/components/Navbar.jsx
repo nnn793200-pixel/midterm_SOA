@@ -3,13 +3,12 @@ import {
   Landmark,
   CreditCard,
   History,
-  Mail,
   RotateCcw,
   LogOut,
   Wallet,
   UserCheck,
 } from "lucide-react";
-import { formatCurrency, MAILPIT_WEB_URL } from "../api/client";
+import { formatCurrency } from "../api/client";
 
 export default function Navbar({
   user,
@@ -32,9 +31,6 @@ export default function Navbar({
               <div className="flex items-center gap-2">
                 <span className="font-extrabold text-lg tracking-tight">
                   TDTU iBANKING
-                </span>
-                <span className="text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full bg-amber-400/20 text-amber-300 border border-amber-300/30">
-                  SOA Microservices
                 </span>
               </div>
               <p className="text-xs text-blue-200">
@@ -68,19 +64,8 @@ export default function Navbar({
               }`}
             >
               <History className="w-4 h-4" />
-              <span>Lịch sử GD & Saga Logs</span>
+              <span>Lịch sử giao dịch</span>
             </button>
-
-            <a
-              href={MAILPIT_WEB_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 hover:bg-emerald-500/30 transition"
-              title="Mở hộp thư Mailpit để xem Email OTP & Biên lai"
-            >
-              <Mail className="w-4 h-4 text-emerald-300" />
-              <span className="hidden md:inline">Hộp thư Email (:8025)</span>
-            </a>
           </nav>
 
           {/* User Info & Actions */}

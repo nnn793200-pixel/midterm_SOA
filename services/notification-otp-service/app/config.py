@@ -13,6 +13,14 @@ class Settings(BaseSettings):
     OTP_TTL_SECONDS: int = int(os.getenv("OTP_TTL_SECONDS", "300"))
     SMTP_HOST: str = os.getenv("SMTP_HOST", "localhost")
     SMTP_PORT: int = int(os.getenv("SMTP_PORT", "1025"))
+    SMTP_USER: str = os.getenv("SMTP_USER", "").strip()
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "").replace(" ", "").strip()
+    SMTP_TLS: bool = os.getenv("SMTP_TLS", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     SMTP_FROM_EMAIL: str = os.getenv(
         "SMTP_FROM_EMAIL", "ibanking-noreply@tdtu.edu.vn"
     )

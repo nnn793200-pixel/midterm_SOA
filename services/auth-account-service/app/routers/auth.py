@@ -1,5 +1,6 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import UserAccount, AccountLedgerEntry
@@ -19,7 +20,7 @@ router = APIRouter(tags=["Authentication & Account Profile"])
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = (
         db.query(UserAccount)
-        .filter(UserAccount.username == payload.username.strip())
+        .filter(func.lower(UserAccount.username) == payload.username.strip().lower())
         .first()
     )
 

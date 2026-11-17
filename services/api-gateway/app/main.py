@@ -249,6 +249,34 @@ async def route_payment_history(
 
 
 @app.get(
+    "/api/v1/payments/tuition-status/{student_id}",
+    tags=["3. Payment Workflow & Saga"],
+)
+async def route_tuition_payment_status(
+    student_id: str,
+    request: Request,
+    jwt_claims: Dict[str, Any] = Depends(verify_jwt_token),
+):
+    target_url = (
+        f"{settings.PAYMENT_SERVICE_URL}/payments/tuition-status/{student_id}"
+    )
+    return await forward_request(request, target_url, jwt_claims=jwt_claims)
+
+
+@app.post(
+    "/api/v1/payments/{transaction_id}/cancel",
+    tags=["3. Payment Workflow & Saga"],
+)
+async def route_cancel_payment(
+    transaction_id: str,
+    request: Request,
+    jwt_claims: Dict[str, Any] = Depends(verify_jwt_token),
+):
+    target_url = f"{settings.PAYMENT_SERVICE_URL}/payments/{transaction_id}/cancel"
+    return await forward_request(request, target_url, jwt_claims=jwt_claims)
+
+
+@app.get(
     "/api/v1/payments/{transaction_id}", tags=["3. Payment Workflow & Saga"]
 )
 async def route_payment_detail(

@@ -450,3 +450,33 @@ Các API dưới đây chỉ được `expose:` trong mạng nội bộ cách ly
 | `POST` | `/internal/notifications/payment-receipt` | Gửi email biên lai xác nhận thanh toán học phí thành công qua SMTP và lưu vết `notification_logs` với trạng thái trung thực (`SENT` hoặc `FAILED`). | `{ "transaction_id", "transaction_code", "recipient_email", "payer_name", "payer_phone", "student_id", "student_name", "semester_name", "amount", "balance_before", "balance_after", "paid_at" }` | `200 OK`, `403` |
 | `GET` | `/internal/otp/debug/{transaction_id}` | Tra cứu nhanh OTP phục vụ Automated Tests / Demo qua `payment-service`. | `-` | `200 OK`, `403`, `404` |
 | `POST` | `/internal/otp/reset-demo` | Xóa sạch OTP & notification logs khi reset dữ liệu demo. | `-` | `200 OK`, `403` |
+
+
+---
+
+## 7. HÀNG ĐỢI CHỜ THEO MSSV (CHECKOUT LOCK)
+
+Khi người dùng bấm *Xác nhận giao dịch*, `payment-service` giữ chỗ MSSV bằng khoá Redis `checkout_lock:{MSSV}` (`SET NX EX`, TTL = thời gian sống OTP 300s, giá trị gồm `transaction_id` và `user_id`). Khoá này **không phải** DB row lock; `SELECT ... FOR UPDATE` vẫn chỉ được dùng tại thời điểm xác thực OTP thành công.
+
+### 7.1. `POST /api/v1/payments/initiate` – bổ sung phản hồi chờ
+- `201 Created`: bạn là người giữ khoá, OTP đã được gửi qua email.
+- `202 Accepted` (MSSV đang có người khác chờ nhập OTP, **không gửi OTP**):
+```json
+{
+  "status": "WAITING_FOR_OTHER_PAYMENT",
+  "student_id": "524K0033",
+  "student_full_name": "Huỳnh Trung Tín",
+  "message": "Đang có người dùng khác thực hiện thanh toán cho MSSV này. Vui lòng chờ...",
+  "retry_after_seconds": 2
+}
+```
+
+### 7.2. `GET /api/v1/payments/tuition-status/{student_id}` (JWT)
+Frontend polling mỗi 2 giây khi ở màn hình chờ.
+```json
+{ "student_id": "524K0033", "student_full_name": "Huỳnh Trung Tín", "tuition_status": "UNPAID", "state": "LOCKED", "locked_by_me": false }
+```
+`state` ∈ `AVAILABLE` (khoá trống, người chờ tự gọi lại `initiate` và nhận OTP) | `LOCKED` (tiếp tục chờ) | `PAID` (đã được người khác thanh toán thành công).
+
+### 7.3. `POST /api/v1/payments/{transaction_id}/cancel` (JWT, chỉ chủ giao dịch)
+Gọi khi người dùng đóng khung nhập OTP: giao dịch `PENDING_OTP` chuyển sang `FAILED` (`cancelled: true`) và khoá `checkout_lock:{MSSV}` được giải phóng ngay. Khoá cũng tự giải phóng khi giao dịch kết thúc (thành công, thất bại, hết hạn OTP, nhập sai OTP quá 5 lần) hoặc hết TTL. Lỗi: `404 TRANSACTION_NOT_FOUND`.

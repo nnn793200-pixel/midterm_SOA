@@ -121,6 +121,9 @@ services:
       OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-300}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-false}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-ibanking-noreply@tdtu.edu.vn}
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-TDTU iBanking System}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-tdtu-soa-2026-internal-service-secret-9999}
@@ -136,6 +139,7 @@ services:
         condition: service_started
     networks:
       - internal_network
+      - public_network
 
   # ==========================================================================
   # 7. MICROSERVICE 3: payment-service [Saga Orchestrator] (Port 8003 nội bộ -> payment_db + Redis)
