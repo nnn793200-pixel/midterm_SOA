@@ -119,6 +119,7 @@ docker compose up --build -d
 | Thành phần | URL / Endpoint | Mô tả |
 | :--- | :--- | :--- |
 | **Giao diện Web (Frontend)** | [http://localhost:5173](http://localhost:5173) *(Public)* | Giao diện người dùng TDTU iBanking (React + Vite + Tailwind CSS) |
+| **RedisInsight** | [http://localhost:5540](http://localhost:5540) *(Public)* | Giao diện quản trị Redis; thêm database với host `redis` và port `6379` |
 | **API Gateway (Swagger UI)** | [http://localhost:8000/docs](http://localhost:8000/docs) *(Public)* | Cổng vào duy nhất & tài liệu Swagger tập trung cho mọi REST API (`/api/v1/*`) |
 | **Auth & Account Service** | `auth-account-service:8001` *(Cô lập nội bộ `internal_network`)* | Quản lý tài khoản, JWT & trừ/hoàn tiền nguyên tử |
 | **Tuition Service** | `tuition-service:8002` *(Cô lập nội bộ `internal_network`)* | Quản lý sinh viên TDTU & gạch nợ học phí |

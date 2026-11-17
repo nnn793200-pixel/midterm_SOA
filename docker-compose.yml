@@ -44,7 +44,25 @@ services:
       - internal_network
 
   # ==========================================================================
-  # 3. MAILPIT (SMTP nội bộ 1025 & Giao diện Web xem Email cổng 8025)
+  # 3. REDISINSIGHT (Redis Web UI on host port 5540)
+  # ==========================================================================
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: ibanking-redisinsight
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - public_network
+      - internal_network
+
+  # ==========================================================================
+  # 4. MAILPIT (SMTP nội bộ 1025 & Giao diện Web xem Email cổng 8025)
   # ==========================================================================
   mailpit:
     image: axllent/mailpit:latest
@@ -231,6 +249,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  redisinsight_data:
 
 networks:
   public_network:
