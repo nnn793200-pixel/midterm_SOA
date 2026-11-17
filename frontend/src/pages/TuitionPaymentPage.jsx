@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   User,
   Phone,
@@ -10,7 +10,6 @@ import {
   XCircle,
   AlertTriangle,
   ShieldCheck,
-  Sparkles,
   Lock,
   Loader2,
   Info,
@@ -18,6 +17,7 @@ import {
 import { api, formatCurrency, generateUuid } from "../api/client";
 import OtpModal from "../components/OtpModal";
 import ReceiptModal from "../components/ReceiptModal";
+import WaitingModal from "../components/WaitingModal";
 
 export default function TuitionPaymentPage({
   user,
@@ -25,8 +25,7 @@ export default function TuitionPaymentPage({
   onNavigateHistory,
   refreshTrigger,
 }) {
-  const [mssvInput, setMssvInput] = useState("524K0032");
-  const [sampleTuitions, setSampleTuitions] = useState([]);
+  const [mssvInput, setMssvInput] = useState("");
   const [tuitionResult, setTuitionResult] = useState(null);
   const [lookupError, setLookupError] = useState(null);
   const [isLookingUp, setIsLookingUp] = useState(false);
@@ -37,20 +36,8 @@ export default function TuitionPaymentPage({
 
   const [pendingTx, setPendingTx] = useState(null);
   const [completedReceipt, setCompletedReceipt] = useState(null);
-
-  // Load danh sách MSSV mẫu để chọn nhanh khi Demo
-  const fetchSampleTuitions = async () => {
-    try {
-      const list = await api.listAllTuitions();
-      setSampleTuitions(Array.isArray(list) ? list : []);
-    } catch {
-      // Ignore
-    }
-  };
-
-  useEffect(() => {
-    fetchSampleTuitions();
-  }, [refreshTrigger]);
+  const [waitingInfo, setWaitingInfo] = useState(null);
+  const waitingPayloadRef = useRef(null);
 
   // Tự động tra cứu học phí khi người dùng nhập MSSV (Debounce 300ms)
   useEffect(() => {
@@ -111,6 +98,13 @@ export default function TuitionPaymentPage({
     !isLookingUp &&
     !isInitiating;
 
+  const buildInitiatePayload = () => ({
+    student_id: student.student_id,
+    tuition_bill_id: bill.id,
+    amount: requiredAmount,
+    terms_accepted: termsAccepted,
+  });
+
   const handleInitiatePayment = async (e) => {
     e.preventDefault();
     if (!canSubmitPayment) return;
@@ -118,17 +112,14 @@ export default function TuitionPaymentPage({
     setInitiateError(null);
     setIsInitiating(true);
     try {
-      const idempotencyKey = generateUuid();
-      const res = await api.initiatePayment(
-        {
-          student_id: student.student_id,
-          tuition_bill_id: bill.id,
-          amount: requiredAmount,
-          terms_accepted: termsAccepted,
-        },
-        idempotencyKey
-      );
-      setPendingTx(res);
+      const payload = buildInitiatePayload();
+      waitingPayloadRef.current = payload;
+      const res = await api.initiatePayment(payload, generateUuid());
+      if (res?.status === "WAITING_FOR_OTHER_PAYMENT") {
+        setWaitingInfo(res);
+      } else {
+        setPendingTx(res);
+      }
     } catch (err) {
       setInitiateError({
         code: err.code || "INITIATE_FAILED",
@@ -140,11 +131,33 @@ export default function TuitionPaymentPage({
     }
   };
 
+  const retryInitiateFromWaiting = () =>
+    api.initiatePayment(waitingPayloadRef.current, generateUuid());
+
+  const handleWaitingGotOtp = (res) => {
+    setWaitingInfo(null);
+    setPendingTx(res);
+  };
+
+  const handleWaitingError = async (err) => {
+    setWaitingInfo(null);
+    setInitiateError({
+      code: err.code || "INITIATE_FAILED",
+      message: err.message,
+      correlationId: err.correlationId,
+    });
+    await handleCompensatedOrFailed();
+  };
+
+  const handleWaitingFinished = async () => {
+    setWaitingInfo(null);
+    await handleCompensatedOrFailed();
+  };
+
   const handleOtpSuccess = async (receiptData) => {
     setPendingTx(null);
     setCompletedReceipt(receiptData);
     await onRefreshUser();
-    await fetchSampleTuitions();
     if (mssvInput.trim()) {
       try {
         const updated = await api.lookupTuitionByMssv(mssvInput.trim());
@@ -157,7 +170,6 @@ export default function TuitionPaymentPage({
 
   const handleCompensatedOrFailed = async () => {
     await onRefreshUser();
-    await fetchSampleTuitions();
     if (mssvInput.trim()) {
       try {
         const updated = await api.lookupTuitionByMssv(mssvInput.trim());
@@ -170,53 +182,6 @@ export default function TuitionPaymentPage({
 
   return (
     <div className="space-y-6">
-      {/* Quick MSSV Selector Bar for Demo */}
-      <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-200 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs font-bold text-slate-700">
-          <Sparkles className="w-4 h-4 text-amber-500" />
-          <span>Chọn nhanh Sinh viên TDTU mẫu (Click để tra cứu MSSV):</span>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {sampleTuitions.map((item) => {
-            const st = item.student;
-            const tb = item.tuition_bill;
-            const isSelected = mssvInput.trim() === st.student_id;
-            const isPaid = tb.status === "PAID";
-            return (
-              <button
-                key={st.student_id}
-                type="button"
-                onClick={() => {
-                  setMssvInput(st.student_id);
-                  setInitiateError(null);
-                }}
-                className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition flex items-center gap-2 ${
-                  isSelected
-                    ? "bg-blue-700 text-white border-blue-700 shadow-sm"
-                    : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                }`}
-              >
-                <span className="font-mono font-bold">{st.student_id}</span>
-                <span>• {st.full_name}</span>
-                <span
-                  className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
-                    isPaid
-                      ? isSelected
-                        ? "bg-rose-200 text-rose-900"
-                        : "bg-rose-100 text-rose-700"
-                      : isSelected
-                      ? "bg-emerald-200 text-emerald-950"
-                      : "bg-emerald-100 text-emerald-800"
-                  }`}
-                >
-                  {isPaid ? "PAID" : formatCurrency(tb.amount)}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
       {/* Main 3-Section Form */}
       <form
         onSubmit={handleInitiatePayment}
@@ -321,7 +286,7 @@ export default function TuitionPaymentPage({
                     type="text"
                     value={mssvInput}
                     onChange={(e) => setMssvInput(e.target.value)}
-                    placeholder="Nhập MSSV TDTU (VD: 524K0032, 524K0033, 524V0007...)"
+                    placeholder="Nhập mã số sinh viên"
                     className="w-full pl-10 pr-28 py-3 rounded-xl border-2 border-blue-300 focus:border-blue-600 focus:ring-4 focus:ring-blue-100 outline-none text-base font-bold font-mono text-slate-900 transition"
                   />
                   {isLookingUp && (
@@ -565,6 +530,19 @@ export default function TuitionPaymentPage({
         </div>
       </form>
 
+      {/* Waiting Modal (có người khác đang thanh toán cho cùng MSSV) */}
+      {waitingInfo && (
+        <WaitingModal
+          waitingInfo={waitingInfo}
+          retryInitiate={retryInitiateFromWaiting}
+          onGotOtp={handleWaitingGotOtp}
+          onPaidDetected={handleCompensatedOrFailed}
+          onError={handleWaitingError}
+          onCancel={() => setWaitingInfo(null)}
+          onFinished={handleWaitingFinished}
+        />
+      )}
+
       {/* OTP Modal */}
       {pendingTx && (
         <OtpModal
@@ -572,6 +550,7 @@ export default function TuitionPaymentPage({
           onClose={() => setPendingTx(null)}
           onSuccess={handleOtpSuccess}
           onCompensatedOrFailed={handleCompensatedOrFailed}
+          onExpired={handleCompensatedOrFailed}
         />
       )}
 

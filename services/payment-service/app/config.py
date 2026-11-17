@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     )
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     OTP_TTL_SECONDS: int = int(os.getenv("OTP_TTL_SECONDS", "300"))
+    PENDING_TIMEOUT_SECONDS: int = int(os.getenv("PENDING_TIMEOUT_SECONDS", "180"))
     INTERNAL_SERVICE_SECRET: str = os.getenv(
         "INTERNAL_SERVICE_SECRET", "tdtu-soa-2026-internal-service-secret-9999"
     )

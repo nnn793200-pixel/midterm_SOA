@@ -145,8 +145,94 @@ def set_idempotency_in_redis(
 def clear_payment_redis_keys() -> None:
     try:
         r = get_redis()
-        for pattern in ("idempotency:*", "lock:account:*", "lock:tuition:*"):
+        for pattern in (
+            "idempotency:*",
+            "lock:account:*",
+            "lock:tuition:*",
+            "checkout_lock:*",
+        ):
             for key in r.scan_iter(pattern):
                 r.delete(key)
     except Exception as exc:
         logger.warning("Redis cleanup skipped: %s", str(exc))
+
+
+# ----------------------------------------------------------------------------
+# CHECKOUT LOCK (giữ chỗ thanh toán theo MSSV trong suốt thời gian chờ nhập OTP)
+# ----------------------------------------------------------------------------
+LUA_RELEASE_CHECKOUT_LOCK = """
+local v = redis.call('GET', KEYS[1])
+if not v then return 0 end
+local d = cjson.decode(v)
+if d.transaction_id == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def checkout_lock_key(student_id: str) -> str:
+    return f"checkout_lock:{student_id.strip().upper()}"
+
+
+def get_checkout_lock(student_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw = get_redis().get(checkout_lock_key(student_id))
+        if raw:
+            return json.loads(raw)
+    except Exception as exc:
+        logger.warning("Redis checkout lock read skipped: %s", str(exc))
+    return None
+
+
+def acquire_checkout_lock(
+    student_id: str,
+    transaction_id: str,
+    user_id: str,
+    ttl_seconds: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Giữ chỗ thanh toán cho MSSV bằng `SET checkout_lock:{MSSV} {...} NX EX ttl`.
+    Trả về None nếu giành được khoá (hoặc Redis không khả dụng), ngược lại trả về
+    thông tin chủ khoá hiện tại ({transaction_id, user_id}).
+    """
+    key = checkout_lock_key(student_id)
+    value = json.dumps({"transaction_id": transaction_id, "user_id": user_id})
+    try:
+        r = get_redis()
+        for _ in range(2):
+            if r.set(key, value, nx=True, ex=ttl_seconds):
+                return None
+            raw = r.get(key)
+            if raw:
+                return json.loads(raw)
+        return None
+    except Exception as exc:
+        logger.warning("Redis checkout lock unavailable, proceeding: %s", str(exc))
+        return None
+
+
+def replace_checkout_lock(
+    student_id: str, transaction_id: str, user_id: str, ttl_seconds: int
+) -> None:
+    try:
+        get_redis().set(
+            checkout_lock_key(student_id),
+            json.dumps({"transaction_id": transaction_id, "user_id": user_id}),
+            ex=ttl_seconds,
+        )
+    except Exception as exc:
+        logger.warning("Redis checkout lock replace skipped: %s", str(exc))
+
+
+def release_checkout_lock(student_id: str, transaction_id: str) -> None:
+    """Chỉ giải phóng khoá nếu khoá vẫn thuộc về đúng transaction_id."""
+    try:
+        get_redis().eval(
+            LUA_RELEASE_CHECKOUT_LOCK,
+            1,
+            checkout_lock_key(student_id),
+            str(transaction_id),
+        )
+    except Exception as exc:
+        logger.warning("Redis checkout lock release skipped: %s", str(exc))

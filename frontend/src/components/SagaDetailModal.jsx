@@ -46,7 +46,7 @@ export default function SagaDetailModal({ detail, onClose }) {
             <GitBranch className="w-5 h-5 text-amber-300" />
             <div>
               <h3 className="font-bold text-base">
-                Chi tiết Luồng Điều phối Saga & Tracing
+                Chi tiết Xử lý Giao dịch
               </h3>
               <p className="text-xs text-slate-300 font-mono">
                 {detail.transaction_code} | Correlation-ID: {detail.correlation_id}
@@ -103,7 +103,7 @@ export default function SagaDetailModal({ detail, onClose }) {
           {/* Saga Step Timeline */}
           <div className="space-y-3">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-              Nhật ký từng bước điều phối Saga (saga_step_logs)
+              Nhật ký các bước xử lý giao dịch
             </h4>
 
             <div className="space-y-2.5">

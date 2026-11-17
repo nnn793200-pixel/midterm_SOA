@@ -120,6 +120,7 @@ export default function App() {
         ) : (
           <TransactionHistoryPage
             user={user}
+            onRefreshUser={refreshUserProfile}
             refreshTrigger={refreshTrigger}
           />
         )}
@@ -130,9 +131,7 @@ export default function App() {
           Nhóm thực hiện: Trần Minh Nghĩa - 524K0032 | Huỳnh Trung Tín - 524K0033 | Phan Nguyễn Thảo Như - 524V0007
         </div>
         <div className="text-slate-500">
-          TDTU iBanking – Dự án Giữa kỳ Môn Kiến Trúc Hướng Dịch Vụ (504070) •
-          API Gateway (:8000) • Auth-Account (:8001) • Tuition (:8002) • Payment
-          Saga (:8003) • Notification-OTP (:8004)
+          TDTU iBanking – Dự án Giữa kỳ Môn Kiến Trúc Hướng Dịch Vụ (504070)
         </div>
       </footer>
     </div>

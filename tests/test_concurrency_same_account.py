@@ -3,7 +3,7 @@ KIỂM THỬ TÌNH HUỐNG CONCURRENCY 1:
 NHIỀU GIAO DỊCH ĐỒNG THỜI TRÊN CÙNG MỘT TÀI KHOẢN (CHỐNG CHI TIÊU VƯỢT SỐ DƯ)
 
 Kịch bản:
-- Tài khoản `nguyenvana` có số dư khả dụng = 25,000,000 VNĐ.
+- Tài khoản `phuhuynh1` có số dư khả dụng = 25,000,000 VNĐ.
 - Người dùng mở 2 phiên giao dịch cùng lúc để đóng học phí cho:
   + Giao dịch 1: MSSV 52200001 (Số tiền: 14,500,000 VNĐ)
   + Giao dịch 2: MSSV 52200002 (Số tiền: 14,500,000 VNĐ)
@@ -16,7 +16,7 @@ Kịch bản:
   1. Khóa Pessimistic (`SELECT ... FOR UPDATE`) trên bảng `users_accounts` tuần tự hóa 2 giao dịch.
   2. Chỉ DUY NHẤT 1 giao dịch thành công (`200 OK`, `COMPLETED`).
   3. Giao dịch còn lại bị từ chối tức khắc (`409 Conflict`, `INSUFFICIENT_BALANCE`).
-  4. Số dư cuối cùng của `nguyenvana` là 10,500,000 VNĐ (Tuyệt đối không bị âm tiền!).
+  4. Số dư cuối cùng của `phuhuynh1` là 10,500,000 VNĐ (Tuyệt đối không bị âm tiền!).
 """
 
 import threading
@@ -32,20 +32,20 @@ def run_concurrency_same_account_test() -> None:
     print("BẮT ĐẦU TEST 2 (CONCURRENCY 1): NHIỀU GIAO DỊCH ĐỒNG THỜI TRÊN CÙNG 1 TÀI KHOẢN")
     print("=" * 80)
 
-    with httpx.Client(base_url=GATEWAY_URL, timeout=15.0) as client:
+    with httpx.Client(base_url=GATEWAY_URL, timeout=30.0) as client:
         # 1. Reset dữ liệu mẫu
         client.post("/system/reset-demo")
 
-        # 2. Đăng nhập tài khoản nguyenvana (Số dư = 25,000,000 VNĐ)
+        # 2. Đăng nhập tài khoản phuhuynh1 (Số dư = 25,000,000 VNĐ)
         login_resp = client.post(
             "/auth/login",
-            json={"username": "nguyenvana", "password": "Password@123"},
+            json={"username": "phuhuynh1", "password": "Password@123"},
         ).json()
         token = login_resp["access_token"]
         headers = {"Authorization": f"Bearer {token}"}
         initial_balance = login_resp["user"]["available_balance"]
         print(
-            f"[•] Tài khoản: nguyenvana | Số dư ban đầu: {initial_balance:,.0f} VNĐ"
+            f"[•] Tài khoản: phuhuynh1 | Số dư ban đầu: {initial_balance:,.0f} VNĐ"
         )
 
         # 3. Tra cứu 2 khoản học phí của 2 MSSV khác nhau (mỗi khoản 14,500,000 VNĐ)
@@ -98,7 +98,7 @@ def run_concurrency_same_account_test() -> None:
         barrier = threading.Barrier(2)
 
         def confirm_worker(tx_id: str, otp_code: str, label: str):
-            with httpx.Client(base_url=GATEWAY_URL, timeout=15.0) as worker_client:
+            with httpx.Client(base_url=GATEWAY_URL, timeout=30.0) as worker_client:
                 barrier.wait()  # Đợi cả 2 luồng sẵn sàng rồi bắn cùng lúc
                 resp = worker_client.post(
                     f"/payments/{tx_id}/confirm-otp",
@@ -124,7 +124,7 @@ def run_concurrency_same_account_test() -> None:
         failed_result = [r for r in results if r[1] == 409][0]
         assert failed_result[2]["error"]["code"] == "INSUFFICIENT_BALANCE"
 
-        # 6. Kiểm tra số dư cuối cùng của tài khoản nguyenvana
+        # 6. Kiểm tra số dư cuối cùng của tài khoản phuhuynh1
         me_after = client.get("/accounts/me", headers=headers).json()
         final_balance = me_after["available_balance"]
         assert final_balance == 10500000.0, (

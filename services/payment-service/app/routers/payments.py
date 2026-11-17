@@ -1,8 +1,9 @@
+import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -11,7 +12,14 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import PaymentTransaction, SagaStepLog, IdempotencyRecord
-from app.redis_client import acquire_payment_locks, clear_payment_redis_keys
+from app.redis_client import (
+    acquire_payment_locks,
+    clear_payment_redis_keys,
+    acquire_checkout_lock,
+    replace_checkout_lock,
+    release_checkout_lock,
+    get_checkout_lock,
+)
 from app.schemas import (
     InitiatePaymentRequest,
     InitiatePaymentResponse,
@@ -42,6 +50,88 @@ from app.saga import (
 )
 
 router = APIRouter(tags=["Payment Saga Orchestrator"])
+logger = logging.getLogger(settings.SERVICE_NAME)
+
+PENDING_STATUSES = ("PENDING", "PENDING_OTP")
+PENDING_EXPIRED_MESSAGE = (
+    "Giao dịch thất bại do quá thời hạn 3 phút chờ xác thực OTP."
+)
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _pending_deadline(created_at: datetime) -> datetime:
+    return _ensure_utc(created_at) + timedelta(
+        seconds=settings.PENDING_TIMEOUT_SECONDS
+    )
+
+
+def _expire_single_pending_tx(
+    db: Session, tx: PaymentTransaction, now: datetime
+) -> None:
+    existing_steps = (
+        db.query(SagaStepLog)
+        .filter(SagaStepLog.transaction_id == tx.id)
+        .all()
+    )
+    next_order = max((s.step_order for s in existing_steps), default=3) + 1
+    append_saga_step(
+        db=db,
+        transaction_id=tx.id,
+        step_order=next_order,
+        step_name="OTP_PENDING_TIMEOUT",
+        target_service="payment-service",
+        step_status="FAILED",
+        error_message=PENDING_EXPIRED_MESSAGE,
+    )
+    tx.status = "FAILED"
+    tx.failure_reason = PENDING_EXPIRED_MESSAGE
+    tx.completed_at = now
+    tx.updated_at = now
+    tx.version = (tx.version or 1) + 1
+
+
+def expire_overdue_pending_transactions(
+    db: Session,
+    student_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> List[uuid.UUID]:
+    """
+    Tự động chuyển mọi giao dịch PENDING/PENDING_OTP đã quá 180 giây (3 phút)
+    kể từ created_at sang trạng thái FAILED, ghi Saga log và mở khoá checkout_lock.
+    """
+    current_time = now or datetime.now(timezone.utc)
+    timeout_seconds = settings.PENDING_TIMEOUT_SECONDS
+    query = db.query(PaymentTransaction).filter(
+        PaymentTransaction.status.in_(PENDING_STATUSES)
+    )
+    if student_id:
+        query = query.filter(
+            PaymentTransaction.student_id == student_id.strip().upper()
+        )
+    candidates = query.all()
+
+    expired_ids: List[uuid.UUID] = []
+    expired_locks = []
+    for tx in candidates:
+        if tx.status not in PENDING_STATUSES:
+            continue
+        elapsed = (current_time - _ensure_utc(tx.created_at)).total_seconds()
+        if elapsed >= timeout_seconds:
+            _expire_single_pending_tx(db, tx, current_time)
+            expired_ids.append(tx.id)
+            expired_locks.append((tx.student_id, str(tx.id)))
+
+    if expired_ids:
+        db.commit()
+        for sid, tid in expired_locks:
+            release_checkout_lock(sid, tid)
+
+    return expired_ids
 
 
 def generate_transaction_code() -> str:
@@ -181,13 +271,99 @@ def initiate_payment(
             },
         )
 
-    # 5. Khởi tạo bản ghi giao dịch ở trạng thái PENDING_OTP & xử lý cạnh tranh Idempotency-Key đồng thời
+    # 5. Kiểm tra hết hạn các giao dịch PENDING quá 3 phút & kiểm tra giao dịch PENDING còn hạn của chính user này
     now = datetime.now(timezone.utc)
-    otp_expires_at = now + timedelta(seconds=settings.OTP_TTL_SECONDS)
+    timeout_seconds = settings.PENDING_TIMEOUT_SECONDS
+    otp_expires_at = now + timedelta(seconds=timeout_seconds)
     tx_code = generate_transaction_code()
+    new_tx_id = uuid.uuid4()
+    lock_student_id = student_data["student_id"]
+
+    expire_overdue_pending_transactions(db, student_id=lock_student_id, now=now)
+
+    existing_own_pending = (
+        db.query(PaymentTransaction)
+        .filter(
+            PaymentTransaction.payer_account_id == payer_uuid,
+            PaymentTransaction.student_id == lock_student_id,
+            PaymentTransaction.status.in_(PENDING_STATUSES),
+        )
+        .order_by(PaymentTransaction.created_at.desc())
+        .first()
+    )
+    if existing_own_pending is not None:
+        deadline = _pending_deadline(existing_own_pending.created_at)
+        remaining_seconds = max(0, int((deadline - now).total_seconds()))
+        if remaining_seconds > 0 and existing_own_pending.tuition_bill_id == uuid.UUID(
+            str(bill_data["id"])
+        ):
+            replace_checkout_lock(
+                lock_student_id,
+                str(existing_own_pending.id),
+                str(payer_uuid),
+                remaining_seconds,
+            )
+            resumed_resp = InitiatePaymentResponse(
+                transaction_id=existing_own_pending.id,
+                transaction_code=existing_own_pending.transaction_code,
+                status=existing_own_pending.status,
+                payer=PayerSummarySchema(
+                    account_id=existing_own_pending.payer_account_id,
+                    full_name=existing_own_pending.payer_full_name,
+                    phone_number=existing_own_pending.payer_phone,
+                    email=existing_own_pending.payer_email,
+                    balance_before=float(available_balance),
+                ),
+                tuition=TuitionSummarySchema(
+                    tuition_bill_id=existing_own_pending.tuition_bill_id,
+                    student_id=existing_own_pending.student_id,
+                    student_full_name=existing_own_pending.student_full_name,
+                    semester_code=existing_own_pending.semester_code,
+                    semester_name=existing_own_pending.semester_name,
+                    amount=float(existing_own_pending.amount),
+                    tuition_status="UNPAID",
+                ),
+                otp_info=OtpInfoSchema(
+                    sent_to_email=existing_own_pending.payer_email,
+                    expires_in_seconds=remaining_seconds,
+                    expires_at=deadline,
+                ),
+                message="Bạn đang có giao dịch chờ xác thực OTP cho MSSV này. Vui lòng nhập mã OTP đã gửi qua email.",
+            )
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                headers={"X-Request-ID": correlation_id},
+                content=resumed_resp.model_dump(mode="json"),
+            )
+
+    lock_owner = acquire_checkout_lock(
+        student_id=lock_student_id,
+        transaction_id=str(new_tx_id),
+        user_id=str(payer_uuid),
+        ttl_seconds=timeout_seconds,
+    )
+    if lock_owner is not None:
+        if lock_owner.get("user_id") != str(payer_uuid):
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content={
+                    "status": "WAITING_FOR_OTHER_PAYMENT",
+                    "student_id": lock_student_id,
+                    "student_full_name": student_data["full_name"],
+                    "message": "Đang có người dùng khác thực hiện thanh toán cho MSSV này. Vui lòng chờ...",
+                    "retry_after_seconds": 2,
+                },
+            )
+        replace_checkout_lock(
+            lock_student_id,
+            str(new_tx_id),
+            str(payer_uuid),
+            timeout_seconds,
+        )
 
     try:
         tx = PaymentTransaction(
+            id=new_tx_id,
             transaction_code=tx_code,
             payer_account_id=payer_uuid,
             payer_full_name=account_data["full_name"],
@@ -281,10 +457,10 @@ def initiate_payment(
             ),
             otp_info=OtpInfoSchema(
                 sent_to_email=tx.payer_email,
-                expires_in_seconds=otp_resp["expires_in_seconds"],
+                expires_in_seconds=timeout_seconds,
                 expires_at=tx.otp_expires_at,
             ),
-            message="Mã OTP đã được gửi đến địa chỉ email của người nộp tiền. Mã có hiệu lực tối đa 5 phút.",
+            message="Mã OTP đã được gửi đến địa chỉ email của người nộp tiền. Giao dịch chờ xác thực trong vòng 3 phút.",
         )
 
         save_idempotency(
@@ -299,6 +475,7 @@ def initiate_payment(
         return response_obj
     except IntegrityError:
         db.rollback()
+        release_checkout_lock(lock_student_id, str(new_tx_id))
         cached_after_race = check_idempotency(
             db=db,
             idempotency_key=clean_idem_key,
@@ -318,7 +495,104 @@ def initiate_payment(
         )
     except HTTPException:
         db.rollback()
+        release_checkout_lock(lock_student_id, str(new_tx_id))
         raise
+    except Exception:
+        db.rollback()
+        release_checkout_lock(lock_student_id, str(new_tx_id))
+        raise
+
+
+@router.post(
+    "/payments/{transaction_id}/cancel",
+    status_code=status.HTTP_200_OK,
+)
+def cancel_pending_payment(
+    transaction_id: uuid.UUID,
+    current_user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Người nộp tiền đóng/hủy khung nhập OTP: hủy giao dịch PENDING_OTP và giải phóng
+    checkout_lock của MSSV để người đang chờ được xử lý ngay.
+    """
+    payer_uuid = uuid.UUID(current_user_id)
+    tx = (
+        db.query(PaymentTransaction)
+        .filter(
+            PaymentTransaction.id == transaction_id,
+            PaymentTransaction.payer_account_id == payer_uuid,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not tx:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "TRANSACTION_NOT_FOUND",
+                "message": "Không tìm thấy giao dịch thanh toán.",
+            },
+        )
+
+    cancelled = False
+    if tx.status == "PENDING_OTP":
+        now = datetime.now(timezone.utc)
+        tx.status = "FAILED"
+        tx.failure_reason = "Người dùng đã hủy giao dịch tại bước nhập OTP."
+        tx.completed_at = now
+        tx.version = tx.version + 1
+        tx.updated_at = now
+        cancelled = True
+    db.commit()
+    release_checkout_lock(tx.student_id, str(tx.id))
+    return {
+        "transaction_id": str(tx.id),
+        "status": tx.status,
+        "cancelled": cancelled,
+        "message": "Đã hủy giao dịch và giải phóng MSSV."
+        if cancelled
+        else f"Giao dịch không còn ở trạng thái chờ OTP (hiện tại: {tx.status}).",
+    }
+
+
+@router.get(
+    "/payments/tuition-status/{student_id}",
+    status_code=status.HTTP_200_OK,
+)
+def get_tuition_payment_status(
+    request: Request,
+    student_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Trạng thái thanh toán hiện tại của MSSV (dùng cho màn hình chờ polling mỗi 2 giây):
+    PAID | LOCKED (đang có người chờ nhập OTP) | AVAILABLE.
+    """
+    clean_mssv = student_id.strip().upper()
+    expire_overdue_pending_transactions(db, student_id=clean_mssv)
+    correlation_id = getattr(request.state, "correlation_id", str(uuid.uuid4()))
+    lookup = call_precheck_tuition(clean_mssv, correlation_id)
+    bill = lookup["tuition_bill"]
+    student = lookup["student"]
+    lock = get_checkout_lock(clean_mssv)
+
+    if bill["status"] == "PAID":
+        state = "PAID"
+    elif lock is not None:
+        state = "LOCKED"
+    else:
+        state = "AVAILABLE"
+
+    return {
+        "student_id": student["student_id"],
+        "student_full_name": student["full_name"],
+        "tuition_status": bill["status"],
+        "state": state,
+        "locked_by_me": bool(lock and lock.get("user_id") == current_user_id),
+    }
 
 
 @router.post(
@@ -333,6 +607,40 @@ def confirm_otp_and_execute_saga(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
+):
+    """
+    Xác nhận OTP & chạy Saga. Sau khi giao dịch rời trạng thái PENDING_OTP
+    (thành công, thất bại, hết hạn, bù trừ) sẽ giải phóng checkout_lock của MSSV.
+    """
+    try:
+        return _confirm_otp_impl(
+            request, transaction_id, payload, idempotency_key, current_user_id, db
+        )
+    finally:
+        _release_checkout_lock_if_final(db, transaction_id)
+
+
+def _release_checkout_lock_if_final(db: Session, transaction_id: uuid.UUID) -> None:
+    try:
+        tx_state = (
+            db.query(PaymentTransaction)
+            .filter(PaymentTransaction.id == transaction_id)
+            .first()
+        )
+        if tx_state is not None and tx_state.status != "PENDING_OTP":
+            release_checkout_lock(tx_state.student_id, str(tx_state.id))
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Checkout lock release check skipped: %s", str(exc))
+
+
+def _confirm_otp_impl(
+    request: Request,
+    transaction_id: uuid.UUID,
+    payload: ConfirmOtpRequest,
+    idempotency_key: Optional[str],
+    current_user_id: str,
+    db: Session,
 ):
     """
     Bước 2 của Luồng Thanh toán (Sau khi người dùng nhập OTP):
@@ -371,6 +679,8 @@ def confirm_otp_and_execute_saga(
     if cached:
         cached_status, cached_body = cached
         return JSONResponse(status_code=cached_status, content=cached_body)
+
+    expired_ids = expire_overdue_pending_transactions(db)
 
     # 1. Đọc thông tin giao dịch để kiểm tra tồn tại, quyền sở hữu và lấy student_id khóa Redis Lock
     tx_pre = (
@@ -418,8 +728,18 @@ def confirm_otp_and_execute_saga(
                 },
             )
 
-        if tx.status != "PENDING_OTP":
+        if tx.status not in PENDING_STATUSES:
             db.rollback()
+            if tx.id in expired_ids or (
+                tx.status == "FAILED" and tx.failure_reason == PENDING_EXPIRED_MESSAGE
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "OTP_EXPIRED",
+                        "message": PENDING_EXPIRED_MESSAGE,
+                    },
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
@@ -433,16 +753,16 @@ def confirm_otp_and_execute_saga(
             )
 
         now = datetime.now(timezone.utc)
-        if now > tx.otp_expires_at:
-            tx.status = "EXPIRED"
-            tx.failure_reason = "Mã OTP đã hết thời hạn hiệu lực 5 phút."
-            tx.updated_at = now
+        pending_deadline = _pending_deadline(tx.created_at)
+        otp_deadline = _ensure_utc(tx.otp_expires_at)
+        if now >= pending_deadline or now > otp_deadline:
+            _expire_single_pending_tx(db, tx, now)
             db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "code": "OTP_EXPIRED",
-                    "message": "Mã OTP đã hết thời hạn hiệu lực 5 phút. Vui lòng khởi tạo giao dịch mới.",
+                    "message": PENDING_EXPIRED_MESSAGE,
                 },
             )
 
@@ -476,6 +796,14 @@ def confirm_otp_and_execute_saga(
             if err_code == "OTP_EXPIRED":
                 tx.status = "EXPIRED"
                 tx.failure_reason = err_msg
+            elif (
+                isinstance(exc.detail, dict)
+                and isinstance(exc.detail.get("details"), dict)
+                and exc.detail["details"].get("max_attempts_exceeded")
+            ):
+                tx.status = "FAILED"
+                tx.failure_reason = "Nhập sai mã OTP quá số lần cho phép."
+                tx.completed_at = datetime.now(timezone.utc)
             db.commit()
             raise
 
@@ -926,6 +1254,7 @@ def get_payment_history(
     current_user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    expire_overdue_pending_transactions(db)
     payer_uuid = uuid.UUID(current_user_id)
     query = db.query(PaymentTransaction).filter(
         PaymentTransaction.payer_account_id == payer_uuid
@@ -960,6 +1289,7 @@ def get_transaction_detail(
     current_user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    expire_overdue_pending_transactions(db)
     payer_uuid = uuid.UUID(current_user_id)
     tx = (
         db.query(PaymentTransaction)

@@ -154,20 +154,38 @@ def send_html_email(
     recipient_email: str, subject: str, html_body: str
 ) -> Tuple[str, str]:
     """
-    Gửi email qua Mailpit SMTP Server.
+    Gửi email qua SMTP. Khi có SMTP_USER + SMTP_PASSWORD (hoặc cổng 587/465) dùng
+    EHLO -> STARTTLS -> LOGIN (Gmail SMTP); ngược lại gửi trơn qua Mailpit nội bộ.
     Trả về (delivery_status, smtp_response).
     """
+    sender_email = settings.SMTP_USER or settings.SMTP_FROM_EMAIL
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>"
+    msg["From"] = f"{settings.SMTP_FROM_NAME} <{sender_email}>"
     msg["To"] = recipient_email
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    use_auth = bool(settings.SMTP_USER and settings.SMTP_PASSWORD)
+    use_ssl = settings.SMTP_PORT == 465
+    use_starttls = not use_ssl and (
+        settings.SMTP_TLS or use_auth or settings.SMTP_PORT == 587
+    )
+
     try:
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=5) as server:
-            server.sendmail(
-                settings.SMTP_FROM_EMAIL, [recipient_email], msg.as_string()
+        if use_ssl:
+            server = smtplib.SMTP_SSL(
+                settings.SMTP_HOST, settings.SMTP_PORT, timeout=20
             )
+        else:
+            server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=20)
+        with server:
+            server.ehlo()
+            if use_starttls:
+                server.starttls()
+                server.ehlo()
+            if use_auth:
+                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.sendmail(sender_email, [recipient_email], msg.as_string())
         logger.info("Sent email to %s | Subject: %s", recipient_email, subject)
         return "SENT", f"250 OK via {settings.SMTP_HOST}:{settings.SMTP_PORT}"
     except Exception as exc:

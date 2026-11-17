@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   History,
   GitBranch,
@@ -8,35 +8,103 @@ import {
   RotateCcw,
   Clock,
   BookOpen,
+  CreditCard,
 } from "lucide-react";
 import { api, formatCurrency, formatDateTime } from "../api/client";
 import SagaDetailModal from "../components/SagaDetailModal";
+import OtpModal from "../components/OtpModal";
+import ReceiptModal from "../components/ReceiptModal";
 
-export default function TransactionHistoryPage({ user, refreshTrigger }) {
+const PENDING_WINDOW_SECONDS = 180;
+
+const isPendingStatus = (status) =>
+  status === "PENDING" || status === "PENDING_OTP";
+
+const getPendingRemainingSeconds = (tx, nowMs) => {
+  if (!tx?.created_at) return 0;
+  const deadlineMs =
+    new Date(tx.created_at).getTime() + PENDING_WINDOW_SECONDS * 1000;
+  return Math.max(0, Math.floor((deadlineMs - nowMs) / 1000));
+};
+
+const formatCountdown = (sec) => {
+  const mins = String(Math.floor(sec / 60)).padStart(2, "0");
+  const secs = String(sec % 60).padStart(2, "0");
+  return `${mins}:${secs}`;
+};
+
+export default function TransactionHistoryPage({
+  user,
+  onRefreshUser,
+  refreshTrigger,
+}) {
   const [transactions, setTransactions] = useState([]);
   const [ledgerEntries, setLedgerEntries] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedDetail, setSelectedDetail] = useState(null);
+  const [resumingTx, setResumingTx] = useState(null);
+  const [completedReceipt, setCompletedReceipt] = useState(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const expiredTriggeredRef = useRef(new Set());
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setIsLoading(true);
     try {
       const [historyRes, accountRes] = await Promise.all([
         api.getPaymentHistory(),
         api.getMyAccount(),
       ]);
-      setTransactions(historyRes?.items || []);
+      const items = historyRes?.items || [];
+      setTransactions(items);
       setLedgerEntries(accountRes?.recent_ledger_entries || []);
+      setNowMs(Date.now());
+      const activeIds = new Set(
+        items.filter((t) => isPendingStatus(t.status)).map((t) => t.id)
+      );
+      for (const id of expiredTriggeredRef.current) {
+        if (!activeIds.has(id)) {
+          expiredTriggeredRef.current.delete(id);
+        }
+      }
     } catch {
       // Ignore
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadData();
-  }, [refreshTrigger]);
+  }, [loadData, refreshTrigger]);
+
+  const hasPendingTransactions = transactions.some((tx) =>
+    isPendingStatus(tx.status)
+  );
+
+  useEffect(() => {
+    if (!hasPendingTransactions) return;
+    const interval = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [hasPendingTransactions]);
+
+  // Khi bộ đếm ngược 3 phút chạm 00:00 -> tự làm mới để chuyển sang FAILED ngay không cần F5
+  useEffect(() => {
+    const newlyExpired = transactions.filter(
+      (tx) =>
+        isPendingStatus(tx.status) &&
+        getPendingRemainingSeconds(tx, nowMs) === 0 &&
+        !expiredTriggeredRef.current.has(tx.id)
+    );
+    if (newlyExpired.length === 0) return;
+
+    newlyExpired.forEach((tx) => expiredTriggeredRef.current.add(tx.id));
+    const timer = setTimeout(() => {
+      loadData();
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [transactions, nowMs, loadData]);
 
   const handleOpenSagaDetail = async (txId) => {
     try {
@@ -47,8 +115,50 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
     }
   };
 
-  const renderStatusBadge = (status) => {
-    switch (status) {
+  const handleResumePayment = (tx) => {
+    const remainingSec = getPendingRemainingSeconds(tx, Date.now());
+    if (remainingSec <= 0) {
+      loadData();
+      return;
+    }
+    const deadlineIso = new Date(
+      new Date(tx.created_at).getTime() + PENDING_WINDOW_SECONDS * 1000
+    ).toISOString();
+
+    setResumingTx({
+      transaction_id: tx.id,
+      transaction_code: tx.transaction_code,
+      status: tx.status,
+      tuition: {
+        student_id: tx.student_id,
+        student_full_name: tx.student_full_name,
+        semester_code: tx.semester_code,
+        semester_name: tx.semester_name,
+        amount: tx.amount,
+      },
+      otp_info: {
+        sent_to_email: tx.payer_email,
+        expires_in_seconds: remainingSec,
+        expires_at: deadlineIso,
+      },
+    });
+  };
+
+  const renderStatusBadge = (tx) => {
+    if (isPendingStatus(tx.status)) {
+      const remaining = getPendingRemainingSeconds(tx, nowMs);
+      return (
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+          <Clock className="w-3.5 h-3.5" />
+          <span>PENDING (Đang chờ xác thực)</span>
+          <span className="font-mono bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded">
+            {formatCountdown(remaining)}
+          </span>
+        </span>
+      );
+    }
+
+    switch (tx.status) {
       case "COMPLETED":
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
@@ -58,23 +168,16 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
         );
       case "COMPENSATED":
         return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-sky-100 text-sky-800 border border-sky-300">
             <RotateCcw className="w-3.5 h-3.5" />
             COMPENSATED (Đã hoàn tiền)
-          </span>
-        );
-      case "PENDING_OTP":
-        return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-300">
-            <Clock className="w-3.5 h-3.5" />
-            PENDING_OTP (Chờ OTP)
           </span>
         );
       default:
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-300">
             <XCircle className="w-3.5 h-3.5" />
-            {status}
+            {tx.status}
           </span>
         );
     }
@@ -126,60 +229,90 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
                   <th className="py-3.5 px-4 text-right">Số dư Sau GD</th>
                   <th className="py-3.5 px-4">Trạng thái</th>
                   <th className="py-3.5 px-4">Thời gian</th>
-                  <th className="py-3.5 px-4 text-center">Chi tiết Saga</th>
+                  <th className="py-3.5 px-4 text-center">Chi tiết</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {transactions.map((tx) => (
-                  <tr
-                    key={tx.id}
-                    className="hover:bg-slate-50 transition-colors"
-                  >
-                    <td className="py-3.5 px-4 font-mono font-bold text-blue-800">
-                      {tx.transaction_code}
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <div className="font-bold text-slate-900">
-                        {tx.student_full_name}
-                      </div>
-                      <div className="text-slate-500 font-mono">
-                        MSSV: {tx.student_id}
-                      </div>
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-700">
-                      {tx.semester_name}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-extrabold text-slate-900">
-                      {formatCurrency(tx.amount)}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-semibold text-blue-800">
-                      {tx.balance_after !== null
-                        ? formatCurrency(tx.balance_after)
-                        : "—"}
-                    </td>
-                    <td className="py-3.5 px-4">
-                      {renderStatusBadge(tx.status)}
-                      {tx.failure_reason && (
-                        <p className="text-[11px] text-slate-500 mt-1 max-w-xs">
-                          {tx.failure_reason}
-                        </p>
-                      )}
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-600">
-                      {formatDateTime(tx.completed_at || tx.created_at)}
-                    </td>
-                    <td className="py-3.5 px-4 text-center">
-                      <button
-                        type="button"
-                        onClick={() => handleOpenSagaDetail(tx.id)}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 font-bold text-xs transition"
-                      >
-                        <GitBranch className="w-3.5 h-3.5" />
-                        <span>Saga Logs</span>
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {transactions.map((tx) => {
+                  const canResume =
+                    isPendingStatus(tx.status) &&
+                    getPendingRemainingSeconds(tx, nowMs) > 0;
+                  return (
+                    <tr
+                      key={tx.id}
+                      onClick={
+                        canResume ? () => handleResumePayment(tx) : undefined
+                      }
+                      className={`transition-colors ${
+                        canResume
+                          ? "bg-amber-50/40 hover:bg-amber-50 cursor-pointer"
+                          : "hover:bg-slate-50"
+                      }`}
+                    >
+                      <td className="py-3.5 px-4 font-mono font-bold text-blue-800">
+                        {tx.transaction_code}
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <div className="font-bold text-slate-900">
+                          {tx.student_full_name}
+                        </div>
+                        <div className="text-slate-500 font-mono">
+                          MSSV: {tx.student_id}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-700">
+                        {tx.semester_name}
+                      </td>
+                      <td className="py-3.5 px-4 text-right font-extrabold text-slate-900">
+                        {formatCurrency(tx.amount)}
+                      </td>
+                      <td className="py-3.5 px-4 text-right font-semibold text-blue-800">
+                        {tx.balance_after !== null
+                          ? formatCurrency(tx.balance_after)
+                          : "—"}
+                      </td>
+                      <td className="py-3.5 px-4">
+                        {renderStatusBadge(tx)}
+                        {tx.failure_reason && (
+                          <p className="text-[11px] text-slate-500 mt-1 max-w-xs">
+                            {tx.failure_reason}
+                          </p>
+                        )}
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-600">
+                        {formatDateTime(tx.completed_at || tx.created_at)}
+                      </td>
+                      <td className="py-3.5 px-4 text-center">
+                        <div className="inline-flex items-center justify-center gap-2">
+                          {canResume && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleResumePayment(tx);
+                              }}
+                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white font-bold text-xs shadow-sm transition"
+                            >
+                              <CreditCard className="w-3.5 h-3.5" />
+                              <span>Thanh toán tiếp</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenSagaDetail(tx.id);
+                            }}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 font-bold text-xs transition"
+                          >
+                            <GitBranch className="w-3.5 h-3.5" />
+                            <span>Xem chi tiết</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -191,7 +324,7 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
         <div className="bg-blue-950 text-white px-6 py-3.5 flex items-center gap-2.5">
           <BookOpen className="w-4 h-4 text-emerald-300" />
           <h3 className="font-bold text-xs uppercase tracking-wider">
-            Sổ cái Biến động Số dư Tài khoản (account_ledger_entries - Trừ tiền & Hoàn tiền bù trừ Saga)
+            Sổ cái Biến động Số dư Tài khoản
           </h3>
         </div>
 
@@ -227,7 +360,7 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
                         >
                           {isDebit
                             ? "DEBIT (Trừ tiền)"
-                            : "COMPENSATION_REFUND (Hoàn tiền Saga)"}
+                            : "COMPENSATION_REFUND (Hoàn tiền)"}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right font-medium text-slate-700">
@@ -259,11 +392,42 @@ export default function TransactionHistoryPage({ user, refreshTrigger }) {
         </div>
       </div>
 
-      {/* Saga Detail Modal */}
+      {/* Chi tiết xử lý giao dịch */}
       {selectedDetail && (
         <SagaDetailModal
           detail={selectedDetail}
           onClose={() => setSelectedDetail(null)}
+        />
+      )}
+
+      {/* Tiếp tục nhập OTP từ Lịch sử giao dịch */}
+      {resumingTx && (
+        <OtpModal
+          pendingTx={resumingTx}
+          onClose={() => setResumingTx(null)}
+          onSuccess={async (receiptData) => {
+            setResumingTx(null);
+            setCompletedReceipt(receiptData);
+            onRefreshUser && (await onRefreshUser());
+            await loadData();
+          }}
+          onCompensatedOrFailed={async () => {
+            onRefreshUser && (await onRefreshUser());
+            await loadData();
+          }}
+          onExpired={loadData}
+        />
+      )}
+
+      {/* Biên lai sau khi thanh toán tiếp thành công */}
+      {completedReceipt && (
+        <ReceiptModal
+          receipt={completedReceipt}
+          onClose={() => setCompletedReceipt(null)}
+          onViewHistory={() => {
+            setCompletedReceipt(null);
+            loadData();
+          }}
         />
       )}
     </div>
