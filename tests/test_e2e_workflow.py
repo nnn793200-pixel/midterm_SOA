@@ -26,7 +26,7 @@ def run_e2e_workflow_test() -> None:
     print("BẮT ĐẦU TEST 1: LUỒNG NGHIỆP VỤ E2E, QUY TẮC BẮT BUỘC, IDEMPOTENCY & OTP")
     print("=" * 80)
 
-    with httpx.Client(base_url=GATEWAY_URL, timeout=15.0) as client:
+    with httpx.Client(base_url=GATEWAY_URL, timeout=30.0) as client:
         # 1. Reset toàn bộ dữ liệu mẫu
         reset_resp = client.post("/system/reset-demo")
         assert reset_resp.status_code == 200, f"Reset failed: {reset_resp.text}"
@@ -41,10 +41,10 @@ def run_e2e_workflow_test() -> None:
             assert svc_info.get("status") == "UP", f"Service {svc_name} is not UP!"
         print("[✓] 2. Tất cả 4 Microservices (Auth, Tuition, Payment, OTP) đều đang UP.")
 
-        # 3. Đăng nhập tài khoản nguyenvana (Số dư: 25,000,000 VNĐ)
+        # 3. Đăng nhập tài khoản phuhuynh1 (Số dư: 25,000,000 VNĐ)
         login_resp = client.post(
             "/auth/login",
-            json={"username": "nguyenvana", "password": "Password@123"},
+            json={"username": "phuhuynh1", "password": "Password@123"},
         )
         assert login_resp.status_code == 200
         login_data = login_resp.json()

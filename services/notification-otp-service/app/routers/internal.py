@@ -236,6 +236,9 @@ def verify_otp_one_time(
             detail={
                 "code": "INVALID_OTP",
                 "message": msg,
+                "details": {
+                    "max_attempts_exceeded": lua_status == "MAX_ATTEMPTS_EXCEEDED"
+                },
             },
         )
 

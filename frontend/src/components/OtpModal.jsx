@@ -2,41 +2,72 @@ import React, { useState, useEffect } from "react";
 import {
   ShieldCheck,
   Clock,
-  Mail,
-  Sparkles,
   AlertTriangle,
   X,
   CheckCircle2,
   Loader2,
 } from "lucide-react";
-import { api, formatCurrency, MAILPIT_WEB_URL } from "../api/client";
+import { api, formatCurrency } from "../api/client";
+
+const computeSecondsLeft = (tx) => {
+  const exp = tx?.otp_info?.expires_at;
+  if (exp) {
+    return Math.max(0, Math.floor((new Date(exp).getTime() - Date.now()) / 1000));
+  }
+  return tx?.otp_info?.expires_in_seconds ?? 180;
+};
 
 export default function OtpModal({
   pendingTx,
   onClose,
   onSuccess,
   onCompensatedOrFailed,
+  onExpired,
 }) {
   const [otpCode, setOtpCode] = useState("");
-  const [secondsLeft, setSecondsLeft] = useState(
-    pendingTx?.otp_info?.expires_in_seconds || 300
+  const [secondsLeft, setSecondsLeft] = useState(() =>
+    computeSecondsLeft(pendingTx)
   );
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingDemoOtp, setIsLoadingDemoOtp] = useState(false);
   const [errorBox, setErrorBox] = useState(null);
 
   useEffect(() => {
+    setOtpCode("");
+    setErrorBox(null);
+    const initial = computeSecondsLeft(pendingTx);
+    setSecondsLeft(initial);
     if (!pendingTx?.otp_info?.expires_at) return;
+
     const targetTime = new Date(pendingTx.otp_info.expires_at).getTime();
+    let expiredNotified = false;
+    let expiryTimer = null;
+
+    const notifyExpiredOnce = () => {
+      if (expiredNotified) return;
+      expiredNotified = true;
+      expiryTimer = setTimeout(() => {
+        onExpired && onExpired();
+      }, 450);
+    };
+
+    if (initial === 0) {
+      notifyExpiredOnce();
+    }
 
     const interval = setInterval(() => {
-      const now = Date.now();
-      const diff = Math.max(0, Math.floor((targetTime - now) / 1000));
+      const diff = Math.max(0, Math.floor((targetTime - Date.now()) / 1000));
       setSecondsLeft(diff);
+      if (diff === 0) {
+        notifyExpiredOnce();
+      }
     }, 1000);
 
-    return () => clearInterval(interval);
-  }, [pendingTx]);
+    return () => {
+      clearInterval(interval);
+      if (expiryTimer) clearTimeout(expiryTimer);
+    };
+  }, [pendingTx?.transaction_id, pendingTx?.otp_info?.expires_at]);
 
   const formatCountdown = (sec) => {
     const mins = String(Math.floor(sec / 60)).padStart(2, "0");
@@ -60,6 +91,12 @@ export default function OtpModal({
     } finally {
       setIsLoadingDemoOtp(false);
     }
+  };
+
+  const handleClose = () => {
+    if (isSubmitting) return;
+    // Giữ nguyên trạng thái PENDING trên hệ thống trong 3 phút để có thể thanh toán tiếp
+    onClose();
   };
 
   const handleSubmit = async (e) => {
@@ -92,7 +129,8 @@ export default function OtpModal({
         err.code === "TUITION_PAYMENT_FAILED_COMPENSATED" ||
         err.code === "INSUFFICIENT_BALANCE" ||
         err.code === "COMPENSATION_FAILED" ||
-        err.code === "OTP_EXPIRED"
+        err.code === "OTP_EXPIRED" ||
+        err.details?.max_attempts_exceeded
       ) {
         onCompensatedOrFailed && onCompensatedOrFailed(err);
       }
@@ -104,7 +142,12 @@ export default function OtpModal({
   if (!pendingTx) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget) handleClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden border border-slate-200 animate-in fade-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="bg-gradient-to-r from-blue-900 to-indigo-800 px-6 py-4 text-white flex items-center justify-between">
@@ -121,7 +164,7 @@ export default function OtpModal({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="text-blue-200 hover:text-white p-1 rounded-lg hover:bg-white/10 transition"
           >
             <X className="w-5 h-5" />
@@ -140,8 +183,7 @@ export default function OtpModal({
                 {pendingTx.otp_info?.sent_to_email}
               </p>
               <p className="text-[11px] text-slate-500">
-                • Gắn chặt với giao dịch • Không trùng OTP active khác • Chỉ dùng
-                01 lần
+                • Hiệu lực tối đa 3 phút • Không trùng OTP khác • Chỉ dùng 01 lần
               </p>
             </div>
             <div
@@ -185,23 +227,12 @@ export default function OtpModal({
                 Nhập mã xác thực OTP (6 chữ số)
               </label>
               <div className="flex items-center gap-2">
-                <a
-                  href={MAILPIT_WEB_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700 hover:underline"
-                >
-                  <Mail className="w-3.5 h-3.5" />
-                  <span>Mở Mailpit (:8025)</span>
-                </a>
-                <span className="text-slate-300">|</span>
                 <button
                   type="button"
                   onClick={handleFetchDemoOtp}
                   disabled={isLoadingDemoOtp || secondsLeft === 0}
                   className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-md transition"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
                   <span>
                     {isLoadingDemoOtp ? "Đang lấy..." : "Điền nhanh OTP (Demo)"}
                   </span>
@@ -223,7 +254,16 @@ export default function OtpModal({
             />
           </div>
 
-          {/* Error Box */}
+          {/* Error / Expiry Box */}
+          {secondsLeft === 0 && !errorBox && (
+            <div className="bg-rose-50 border border-rose-300 rounded-xl p-3.5 text-xs text-rose-800 flex items-center gap-2 font-semibold">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>
+                Giao dịch thất bại do quá thời hạn 3 phút chờ xác thực OTP. Vui
+                lòng khởi tạo giao dịch mới.
+              </span>
+            </div>
+          )}
           {errorBox && (
             <div className="bg-rose-50 border border-rose-300 rounded-xl p-3.5 text-xs text-rose-800 space-y-1.5">
               <div className="flex items-center gap-2 font-bold text-rose-900">
@@ -232,7 +272,7 @@ export default function OtpModal({
               </div>
               {typeof errorBox.details?.restored_balance === "number" && (
                 <p className="text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5 font-semibold">
-                  ✓ Saga Compensation: Số dư của bạn đã được hoàn trả nguyên vẹn (
+                  ✓ Số dư của bạn đã được hoàn trả nguyên vẹn (
                   {formatCurrency(errorBox.details.restored_balance)}).
                 </p>
               )}
@@ -255,7 +295,7 @@ export default function OtpModal({
           <div className="flex items-center justify-end gap-3 pt-2">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-semibold text-sm hover:bg-slate-100 transition"
             >
               Đóng
@@ -270,7 +310,7 @@ export default function OtpModal({
               {isSubmitting ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Đang xác thực & Thực thi Saga...</span>
+                  <span>Đang xác thực...</span>
                 </>
               ) : (
                 <>

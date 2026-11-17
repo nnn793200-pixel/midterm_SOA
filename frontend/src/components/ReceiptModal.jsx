@@ -2,16 +2,11 @@ import React from "react";
 import {
   CheckCircle2,
   AlertTriangle,
-  Mail,
   History,
   FileText,
   X,
 } from "lucide-react";
-import {
-  formatCurrency,
-  formatDateTime,
-  MAILPIT_WEB_URL,
-} from "../api/client";
+import { formatCurrency, formatDateTime } from "../api/client";
 
 export default function ReceiptModal({
   receipt,
@@ -115,18 +110,9 @@ export default function ReceiptModal({
               <div className="flex items-center gap-2">
                 <FileText className="w-4 h-4 text-blue-700 shrink-0" />
                 <span>
-                  Email xác nhận giao dịch thành công đã được gửi qua SMTP.
+                  Email xác nhận giao dịch thành công đã được gửi tới hộp thư của bạn.
                 </span>
               </div>
-              <a
-                href={MAILPIT_WEB_URL}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 font-bold text-blue-700 hover:underline shrink-0 ml-2"
-              >
-                <Mail className="w-3.5 h-3.5" />
-                <span>Xem Email</span>
-              </a>
             </div>
           ) : (
             <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 flex items-center justify-between gap-2 text-xs text-amber-900">
@@ -144,15 +130,6 @@ export default function ReceiptModal({
                   )}
                 </div>
               </div>
-              <a
-                href={MAILPIT_WEB_URL}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 font-bold text-amber-800 hover:underline shrink-0 ml-2"
-              >
-                <Mail className="w-3.5 h-3.5" />
-                <span>Xem Email</span>
-              </a>
             </div>
           )}
 

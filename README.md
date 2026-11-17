@@ -9,6 +9,19 @@
 | 2 | **Huỳnh Trung Tín** | `524K0033` | `524k0033@student.tdtu.edu.vn` |
 | 3 | **Phan Nguyễn Thảo Như** | `524V0007` | `524v0007@student.tdtu.edu.vn` |
 
+### Tài khoản đăng nhập & MSSV dùng khi Demo (mật khẩu chung: `Password@123`, username không phân biệt hoa/thường):
+| Username | Password | Họ và tên | Email nhận OTP | Số dư |
+| :--- | :--- | :--- | :--- | ---: |
+| `524K0032` | `Password@123` | Trần Minh Nghĩa | `524k0032@student.tdtu.edu.vn` | `50,000,000 VNĐ` |
+| `524K0033` | `Password@123` | Huỳnh Trung Tín | `524k0033@student.tdtu.edu.vn` | `35,000,000 VNĐ` |
+| `524V0007` | `Password@123` | Phan Nguyễn Thảo Như | `524v0007@student.tdtu.edu.vn` | `50,000,000 VNĐ` |
+| `phuhuynh1` | `Password@123` | Nguyễn Văn An | `524k0032@student.tdtu.edu.vn` *(dùng chung email thật của Nghĩa)* | `25,000,000 VNĐ` |
+| `phuhuynh2` | `Password@123` | Trần Thị Bình | `524k0033@student.tdtu.edu.vn` *(dùng chung email thật của Tín)* | `30,000,000 VNĐ` |
+
+**MSSV tra cứu học phí:** `524K0032` (15,000,000 VNĐ) • `524K0033` (15,000,000 VNĐ) • `524V0007` (14,000,000 VNĐ) • `52200001`, `52200002` (14,500,000 VNĐ) • `52200003` (12,000,000 VNĐ) • `52200004` (16,000,000 VNĐ) • `52200005` (13,500,000 VNĐ, đã `PAID`).
+
+> Email OTP & biên lai được gửi thật qua Gmail SMTP (cấu hình `SMTP_*` trong file `.env`, xem `.env.example`). Thêm tài khoản cho giảng viên: tìm khối `[CHỖ THÊM TÀI KHOẢN / EMAIL CỦA GIẢNG VIÊN KHI DEMO TRÊN LỚP]` trong `services/auth-account-service/app/seed.py` (và `services/tuition-service/app/seed.py`), bỏ comment, điền thông tin rồi bấm **Reset Demo**.
+
 ---
 
 ## 1. TỔNG QUAN & ĐỐI CHIẾU TIÊU CHÍ CHẤM ĐIỂM
@@ -18,7 +31,7 @@ Hệ thống mô phỏng **phân hệ đóng học phí trực tuyến của ứ
 | Tiêu chí Rubric | Trọng số | Hiện thực trong Dự án | Tài liệu / Code Minh chứng |
 | :--- | :---: | :--- | :--- |
 | **1. Phân tích nghiệp vụ & UML** | `1.0đ` | Use Case Diagram và ERD mô tả các actor, entity, thuộc tính, khóa và quan hệ của 4 phân vùng dữ liệu (bao gồm `otp_tokens` và `notification_logs`). | [`docs/use_case_diagram.puml`](./docs/use_case_diagram.puml), [`docs/erd_diagram.puml`](./docs/erd_diagram.puml) |
-| **2. Kiến trúc Microservices** | `1.5đ` | `api-gateway` + 4 Microservices độc lập (`auth-account`, `tuition`, `payment`, `notification-otp`), Database-per-Service trên PostgreSQL 16 + Redis 7 + Mailpit SMTP. | [`docs/architecture_diagram.puml`](./docs/architecture_diagram.puml), [`docs/sequence_diagram.puml`](./docs/sequence_diagram.puml) |
+| **2. Kiến trúc Microservices** | `1.5đ` | `api-gateway` + 4 Microservices độc lập (`auth-account`, `tuition`, `payment`, `notification-otp`), Database-per-Service trên PostgreSQL 16 + Redis 7 + Gmail SMTP. | [`docs/architecture_diagram.puml`](./docs/architecture_diagram.puml), [`docs/sequence_diagram.puml`](./docs/sequence_diagram.puml) |
 | **3. Thiết kế REST API** | `1.0đ` | Các API chính được mô tả theo REST, có request/response model, Pydantic v2 validation, error responses, `Idempotency-Key` và `X-Request-ID`. | [`docs/api_spec.md`](./docs/api_spec.md) |
 | **4. Database & Data Persistence** | `1.0đ` | 4 PostgreSQL Databases độc lập với `CHECK (available_balance >= 0)`, `UNIQUE`, `FK`, `version` và tự động nạp Seed Data khi khởi chạy. | [`infra/postgres/init-multiple-dbs.sql`](./infra/postgres/init-multiple-dbs.sql) |
 | **5. Hiện thực chức năng & Payment Workflow** | `2.0đ` | Đăng nhập JWT, tra cứu học phí theo MSSV, khởi tạo thanh toán toàn bộ, sinh và gửi OTP (TTL 5 phút, dùng một lần), trừ tiền, gạch nợ, lưu lịch sử và gửi email biên lai. | `services/` |
@@ -56,7 +69,7 @@ flowchart TB
     end
 
     subgraph External["External Infrastructure"]
-        MAILPIT["Mailpit SMTP (:1025)\n& Web Inbox UI (:8025)"]
+        SMTP["Gmail SMTP (:587)\n(Email OTP & Biên lai thật)"]
     end
 
     UI -->|REST + JWT + Idempotency-Key| GW
@@ -74,7 +87,7 @@ flowchart TB
     PAYMENT -->|Distributed Lock & Idempotency| REDIS
     OTP --> DB_NOTIF
     OTP --> REDIS
-    OTP -->|SMTP| MAILPIT
+    OTP -->|SMTP TLS| SMTP
 ```
 
 ### Giải thích thiết kế concurrency và Saga:
@@ -106,7 +119,6 @@ docker compose up --build -d
 | Thành phần | URL / Endpoint | Mô tả |
 | :--- | :--- | :--- |
 | **Giao diện Web (Frontend)** | [http://localhost:5173](http://localhost:5173) *(Public)* | Giao diện người dùng TDTU iBanking (React + Vite + Tailwind CSS) |
-| **Hộp thư Email (Mailpit UI)** | [http://localhost:8025](http://localhost:8025) *(Public UI / Internal SMTP :1025)* | Xem trực tiếp các Email chứa mã OTP và Email Biên lai xác nhận |
 | **API Gateway (Swagger UI)** | [http://localhost:8000/docs](http://localhost:8000/docs) *(Public)* | Cổng vào duy nhất & tài liệu Swagger tập trung cho mọi REST API (`/api/v1/*`) |
 | **Auth & Account Service** | `auth-account-service:8001` *(Cô lập nội bộ `internal_network`)* | Quản lý tài khoản, JWT & trừ/hoàn tiền nguyên tử |
 | **Tuition Service** | `tuition-service:8002` *(Cô lập nội bộ `internal_network`)* | Quản lý sinh viên TDTU & gạch nợ học phí |
@@ -121,12 +133,10 @@ docker compose up --build -d
 | Username | Password | Họ và tên | Email | Số dư khả dụng | Mục đích Kiểm thử / Demo |
 | :--- | :--- | :--- | :--- | ---: | :--- |
 | `524K0032` | `Password@123` | Trần Minh Nghĩa | `524k0032@student.tdtu.edu.vn` | `50,000,000 VNĐ` | Tài khoản thành viên nhóm phục vụ Demo trên lớp. |
-| `524K0033` | `Password@123` | Huỳnh Trung Tín | `524k0033@student.tdtu.edu.vn` | `50,000,000 VNĐ` | Tài khoản thành viên nhóm phục vụ Demo trên lớp. |
+| `524K0033` | `Password@123` | Huỳnh Trung Tín | `524k0033@student.tdtu.edu.vn` | `35,000,000 VNĐ` | Tài khoản thành viên nhóm phục vụ Demo trên lớp. |
 | `524V0007` | `Password@123` | Phan Nguyễn Thảo Như | `524v0007@student.tdtu.edu.vn` | `50,000,000 VNĐ` | Tài khoản thành viên nhóm phục vụ Demo trên lớp. |
-| `nguyenvana` | `Password@123` | Nguyễn Văn A | `nguyenvana@tdtu.edu.vn` | `25,000,000 VNĐ` | Đủ đóng 1 khoản `14.5M`, dùng test luồng chính & **Concurrency 1** (đóng 2 khoản `14.5M` cùng lúc). |
-| `tranvanb` | `Password@123` | Trần Văn B | `tranvanb@tdtu.edu.vn` | `30,000,000 VNĐ` | Dùng cùng `nguyenvana` đóng cho cùng 1 MSSV để test **Concurrency 2 + Saga Refund**. |
-| `lethic` | `Password@123` | Lê Thị C | `lethic@tdtu.edu.vn` | `5,000,000 VNĐ` | Số dư nhỏ hơn học phí → kiểm thử nút *"Xác nhận giao dịch"* trên UI. |
-| `phamvand` | `Password@123` | Phạm Văn D | `phamvand@tdtu.edu.vn` | `100,000,000 VNĐ` | Tài khoản số dư lớn để demo đóng nhiều khoản học phí liên tiếp. |
+| `phuhuynh1` | `Password@123` | Nguyễn Văn An | `524k0032@student.tdtu.edu.vn` | `25,000,000 VNĐ` | Người nộp tiền: test luồng chính & **Concurrency 1** (2 khoản `14.5M`); email dùng chung để OTP về hộp thư thật. |
+| `phuhuynh2` | `Password@123` | Trần Thị Bình | `524k0033@student.tdtu.edu.vn` | `30,000,000 VNĐ` | Người nộp tiền thứ hai: cùng `phuhuynh1` đóng cho 1 MSSV để test **hàng đợi chờ (Waiting Screen)**. |
 
 ### 4.2. Danh sách Sinh viên TDTU & Khoản Học phí Mẫu
 | MSSV | Họ và tên Sinh viên | Khoa / Ngành | Số tiền Học phí | Trạng thái Ban đầu |
@@ -155,8 +165,8 @@ Hoặc chạy bằng `pytest`:
 pytest tests/ -v -s
 ```
 
-Bộ kiểm thử gồm 4 module (8 test cases):
+Bộ kiểm thử gồm 4 module (11 test cases):
 1. **[`tests/test_e2e_workflow.py`](./tests/test_e2e_workflow.py):** Kiểm tra luồng E2E, `X-Request-ID`, `Idempotency-Key`, các quy tắc thanh toán, OTP một lần và Saga Step Logs.
-2. **[`tests/test_concurrency_same_account.py`](./tests/test_concurrency_same_account.py):** Gửi đồng thời hai lệnh `confirm-otp` cho cùng tài khoản `nguyenvana`, với hai khoản `14,500,000 VNĐ`. Kết quả mong đợi là một giao dịch `200 OK`, một giao dịch `409 INSUFFICIENT_BALANCE`, và số dư cuối cùng `10,500,000 VNĐ`.
-3. **[`tests/test_concurrency_same_tuition.py`](./tests/test_concurrency_same_tuition.py):** Gửi đồng thời hai lệnh `confirm-otp` từ `nguyenvana` và `tranvanb` cho MSSV `52200001`. Kết quả mong đợi là một giao dịch thành công, giao dịch còn lại được hoàn tiền bù trừ và chuyển sang trạng thái `COMPENSATED`.
-4. **[`tests/test_edge_cases_and_security.py`](./tests/test_edge_cases_and_security.py):** Kiểm tra cô lập mạng `internal_network`, chặn `403` các `/internal/*` thiếu/sai `X-Internal-Service-Token`, mailer trả `"FAILED"` khi lỗi SMTP, `COMPENSATION_FAILED` khi refund lỗi sau 3 lần retry, giữ `COMPLETED` kèm `receipt_email_sent=False` khi lỗi email biên lai, và Redis Lock/Idempotency cache.
+2. **[`tests/test_concurrency_same_account.py`](./tests/test_concurrency_same_account.py):** Gửi đồng thời hai lệnh `confirm-otp` cho cùng tài khoản `phuhuynh1`, với hai khoản `14,500,000 VNĐ`. Kết quả mong đợi là một giao dịch `200 OK`, một giao dịch `409 INSUFFICIENT_BALANCE`, và số dư cuối cùng `10,500,000 VNĐ`.
+3. **[`tests/test_concurrency_same_tuition.py`](./tests/test_concurrency_same_tuition.py):** `phuhuynh1` và `phuhuynh2` cùng thanh toán cho MSSV `524K0033`: người bấm sau nhận `202 WAITING_FOR_OTHER_PAYMENT` (chưa gửi OTP). Nếu người trước hủy khung OTP (`/cancel`) thì khoá `checkout_lock` được giải phóng và người chờ nhận OTP; nếu người trước thanh toán thành công thì người chờ thấy `PAID` và bị chặn `409 TUITION_ALREADY_PAID`.
+4. **[`tests/test_edge_cases_and_security.py`](./tests/test_edge_cases_and_security.py):** Kiểm tra cô lập mạng `internal_network`, chặn `403` các `/internal/*` thiếu/sai `X-Internal-Service-Token`, mailer trả `"FAILED"` khi lỗi SMTP, `COMPENSATION_FAILED` khi refund lỗi sau 3 lần retry, giữ `COMPLETED` kèm `receipt_email_sent=False` khi lỗi email biên lai, công tắc `ENABLE_DEMO_ENDPOINTS`, `?status=` & Idempotency cho nhánh lỗi, Redis Lock/Idempotency cache, và cơ chế hàng đợi chờ `checkout_lock:{MSSV}`.

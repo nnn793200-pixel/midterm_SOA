@@ -1,162 +1,120 @@
 """
-KIỂM THỬ TÌNH HUỐNG CONCURRENCY 2:
-NHIỀU TÀI KHOẢN CÙNG THANH TOÁN MỘT KHOẢN HỌC PHÍ (CHỐNG ĐÓNG TRÙNG + SAGA COMPENSATING REFUND)
+KIỂM THỬ TÌNH HUỐNG CONCURRENCY 2: HAI NGƯỜI CÙNG THANH TOÁN CHO 1 SINH VIÊN (HÀNG ĐỢI CHỜ)
 
-Kịch bản:
-- Hai người dùng độc lập:
-  + Tài khoản A (`nguyenvana` - Số dư: 25,000,000 VNĐ)
-  + Tài khoản B (`tranvanb` - Số dư: 30,000,000 VNĐ)
-- Cả hai cùng tra cứu và khởi tạo giao dịch đóng học phí cho CÙNG MỘT SINH VIÊN:
-  + MSSV `52200001` (Trần Minh Khoa - Số tiền: 14,500,000 VNĐ - Đang `UNPAID`).
-- Cả hai đều vượt qua bước Pre-check và nhận 2 mã OTP hợp lệ (`OTP_A != OTP_B`).
-- Cả hai cùng nhấn xác nhận OTP tại CÙNG MỘT THỜI ĐIỂM (đồng bộ bằng `threading.Barrier(2)`).
-- Kỳ vọng bắt buộc:
-  1. Cả hai đều đủ tiền nên đều đi qua bước trừ tiền trên tài khoản cá nhân của mình.
-  2. Tại `tuition-service`, khóa Pessimistic (`SELECT ... FOR UPDATE`) và kiểm tra `status == 'UNPAID'`
-     chỉ cho phép DUY NHẤT 1 giao dịch cập nhật học phí thành `PAID` (`200 OK`).
-  3. Giao dịch đến sau 1ms nhận `409 Conflict (TUITION_ALREADY_PAID)`.
-  4. Ngay lập tức, `payment-service` (Saga Orchestrator) kích hoạt **Compensating Transaction**
-     (`POST /internal/accounts/refund`) hoàn trả 100% số tiền (14,500,000 VNĐ) về lại tài khoản
-     của người đến sau và đánh dấu giao dịch là `COMPENSATED`.
+Kịch bản (MSSV 524K0033 - Huỳnh Trung Tín, học phí 15,000,000 VNĐ):
+- User A (phuhuynh1) bấm thanh toán trước -> nhận OTP, giữ khoá `checkout_lock:524K0033`.
+- User B (phuhuynh2) bấm thanh toán sau -> API trả `202 WAITING_FOR_OTHER_PAYMENT`, KHÔNG gửi OTP.
+- `GET /payments/tuition-status/524K0033` báo `LOCKED` cho B.
+
+Trường hợp 1: User A hủy khung nhập OTP (`POST /payments/{id}/cancel`)
+  -> khoá được giải phóng (`AVAILABLE`) -> B khởi tạo lại thành công (201), nhận OTP, thanh toán thành công.
+Trường hợp 2: User A thanh toán THÀNH CÔNG
+  -> trạng thái `PAID` -> B khởi tạo lại bị chặn (409 TUITION_ALREADY_PAID) và tổng tiền chỉ bị trừ đúng 1 lần.
 """
 
-import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 GATEWAY_URL = "http://localhost:8000/api/v1"
+MSSV = "524K0033"
+
+
+def _login(client: httpx.Client, username: str) -> dict:
+    resp = client.post(
+        "/auth/login", json={"username": username, "password": "Password@123"}
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def _initiate(client: httpx.Client, headers: dict, bill: dict) -> httpx.Response:
+    return client.post(
+        "/payments/initiate",
+        headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+        json={
+            "student_id": MSSV,
+            "tuition_bill_id": bill["id"],
+            "amount": bill["amount"],
+            "terms_accepted": True,
+        },
+    )
+
+
+def _otp(client: httpx.Client, headers: dict, tx_id: str) -> str:
+    return client.get(f"/payments/{tx_id}/demo-otp", headers=headers).json()["otp_code"]
 
 
 def run_concurrency_same_tuition_test() -> None:
     print("\n" + "=" * 80)
-    print("BẮT ĐẦU TEST 3 (CONCURRENCY 2): NHIỀU TÀI KHOẢN CÙNG ĐÓNG 1 MSSV & SAGA REFUND")
+    print("BẮT ĐẦU TEST 3 (CONCURRENCY 2): 2 NGƯỜI CÙNG ĐÓNG 1 MSSV -> MÀN HÌNH CHỜ (WAITING)")
     print("=" * 80)
 
-    with httpx.Client(base_url=GATEWAY_URL, timeout=15.0) as client:
-        # 1. Reset dữ liệu mẫu
+    with httpx.Client(base_url=GATEWAY_URL, timeout=30.0) as client:
         client.post("/system/reset-demo")
+        headers_a = _login(client, "phuhuynh1")
+        headers_b = _login(client, "phuhuynh2")
+        bill = client.get(f"/tuitions/{MSSV}", headers=headers_a).json()["tuition_bill"]
 
-        # 2. Đăng nhập 2 tài khoản độc lập: nguyenvana (25M) và tranvanb (30M)
-        login_a = client.post(
-            "/auth/login",
-            json={"username": "nguyenvana", "password": "Password@123"},
-        ).json()
-        login_b = client.post(
-            "/auth/login",
-            json={"username": "tranvanb", "password": "Password@123"},
-        ).json()
+        # ---------- Trường hợp 1: User A hủy -> User B nhận OTP ----------
+        init_a = _initiate(client, headers_a, bill)
+        assert init_a.status_code == 201, init_a.text
+        tx_a = init_a.json()["transaction_id"]
 
-        headers_a = {"Authorization": f"Bearer {login_a['access_token']}"}
-        headers_b = {"Authorization": f"Bearer {login_b['access_token']}"}
+        init_b = _initiate(client, headers_b, bill)
+        assert init_b.status_code == 202, init_b.text
+        assert init_b.json()["status"] == "WAITING_FOR_OTHER_PAYMENT"
+        assert init_b.json()["student_id"] == MSSV
+        status_b = client.get(f"/payments/tuition-status/{MSSV}", headers=headers_b).json()
+        assert status_b["state"] == "LOCKED" and status_b["locked_by_me"] is False
+        print("[✓] 1a. User A giữ khoá; User B nhận 202 WAITING_FOR_OTHER_PAYMENT (chưa gửi OTP), MSSV = LOCKED.")
 
-        print(
-            f"[•] Người nộp A: {login_a['user']['full_name']} | Số dư: {login_a['user']['available_balance']:,.0f} VNĐ\n"
-            f"[•] Người nộp B: {login_b['user']['full_name']} | Số dư: {login_b['user']['available_balance']:,.0f} VNĐ"
-        )
+        # User B không thể xác nhận đè lên giao dịch của A
+        cancel_resp = client.post(f"/payments/{tx_a}/cancel", headers=headers_a)
+        assert cancel_resp.status_code == 200 and cancel_resp.json()["cancelled"] is True
+        status_after = client.get(f"/payments/tuition-status/{MSSV}", headers=headers_b).json()
+        assert status_after["state"] == "AVAILABLE"
+        print("[✓] 1b. User A đóng khung OTP (cancel) -> khoá giải phóng ngay, MSSV = AVAILABLE.")
 
-        # 3. Cả A và B cùng tra cứu MSSV 52200001 (14,500,000 VNĐ - UNPAID)
-        tuition_info = client.get("/tuitions/52200001", headers=headers_a).json()
-        bill_id = tuition_info["tuition_bill"]["id"]
-        bill_amount = tuition_info["tuition_bill"]["amount"]
-
-        # 4. Cả A và B cùng khởi tạo giao dịch cho MSSV 52200001
-        init_a = client.post(
-            "/payments/initiate",
-            headers={**headers_a, "Idempotency-Key": str(uuid.uuid4())},
-            json={
-                "student_id": "52200001",
-                "tuition_bill_id": bill_id,
-                "amount": bill_amount,
-                "terms_accepted": True,
-            },
-        )
-        init_b = client.post(
-            "/payments/initiate",
+        init_b2 = _initiate(client, headers_b, bill)
+        assert init_b2.status_code == 201, init_b2.text
+        tx_b = init_b2.json()["transaction_id"]
+        confirm_b = client.post(
+            f"/payments/{tx_b}/confirm-otp",
             headers={**headers_b, "Idempotency-Key": str(uuid.uuid4())},
-            json={
-                "student_id": "52200001",
-                "tuition_bill_id": bill_id,
-                "amount": bill_amount,
-                "terms_accepted": True,
-            },
+            json={"otp_code": _otp(client, headers_b, tx_b)},
         )
-        assert init_a.status_code == 201
-        assert init_b.status_code == 201
+        assert confirm_b.status_code == 200, confirm_b.text
+        assert confirm_b.json()["status"] == "COMPLETED"
+        print("[✓] 1c. User B tự khởi tạo lại, nhận OTP và thanh toán thành công.")
 
-        tx_a_id = init_a.json()["transaction_id"]
-        tx_b_id = init_b.json()["transaction_id"]
+        # ---------- Trường hợp 2: User A thanh toán thành công -> User B thấy PAID ----------
+        client.post("/system/reset-demo")
+        headers_a = _login(client, "phuhuynh1")
+        headers_b = _login(client, "phuhuynh2")
+        bill = client.get(f"/tuitions/{MSSV}", headers=headers_a).json()["tuition_bill"]
 
-        otp_a = client.get(
-            f"/payments/{tx_a_id}/demo-otp", headers=headers_a
-        ).json()["otp_code"]
-        otp_b = client.get(
-            f"/payments/{tx_b_id}/demo-otp", headers=headers_b
-        ).json()["otp_code"]
+        init_a = _initiate(client, headers_a, bill)
+        assert init_a.status_code == 201, init_a.text
+        tx_a = init_a.json()["transaction_id"]
+        assert _initiate(client, headers_b, bill).status_code == 202
 
-        assert otp_a != otp_b, "Hai mã OTP đang active không được phép trùng nhau!"
-        print(
-            f"[✓] Cả 2 tài khoản đã khởi tạo giao dịch cho cùng MSSV 52200001 (14,500,000 VNĐ):\n"
-            f"    - Tài khoản A (nguyenvana): tx_id={tx_a_id} | OTP={otp_a}\n"
-            f"    - Tài khoản B (tranvanb)  : tx_id={tx_b_id} | OTP={otp_b}"
+        confirm_a = client.post(
+            f"/payments/{tx_a}/confirm-otp",
+            headers={**headers_a, "Idempotency-Key": str(uuid.uuid4())},
+            json={"otp_code": _otp(client, headers_a, tx_a)},
         )
+        assert confirm_a.status_code == 200, confirm_a.text
 
-        # 5. Bắn đồng thời confirm-otp từ cả 2 tài khoản tại cùng 1 thời điểm bằng Barrier(2)
-        barrier = threading.Barrier(2)
+        status_paid = client.get(f"/payments/tuition-status/{MSSV}", headers=headers_b).json()
+        assert status_paid["state"] == "PAID" and status_paid["tuition_status"] == "PAID"
+        blocked = _initiate(client, headers_b, bill)
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "TUITION_ALREADY_PAID"
 
-        def confirm_worker(tx_id: str, otp_code: str, user_headers: dict, label: str):
-            with httpx.Client(base_url=GATEWAY_URL, timeout=15.0) as worker_client:
-                barrier.wait()
-                resp = worker_client.post(
-                    f"/payments/{tx_id}/confirm-otp",
-                    headers={**user_headers, "Idempotency-Key": str(uuid.uuid4())},
-                    json={"otp_code": otp_code},
-                )
-                return label, resp.status_code, resp.json()
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            fa = executor.submit(confirm_worker, tx_a_id, otp_a, headers_a, "User_A (nguyenvana)")
-            fb = executor.submit(confirm_worker, tx_b_id, otp_b, headers_b, "User_B (tranvanb)")
-            results = [fa.result(), fb.result()]
-
-        for label, status_code, body in results:
-            print(f"    -> Kết quả {label}: HTTP {status_code} | {body}")
-
-        status_codes = sorted([r[1] for r in results])
-        assert status_codes == [200, 409], (
-            f"Kỳ vọng 1 giao dịch 200 OK và 1 giao dịch 409 Conflict (Compensated), nhưng nhận được: {status_codes}"
-        )
-
-        # Kiểm tra giao dịch bị 409 phải được hoàn tiền tự động (TUITION_ALREADY_PAID_COMPENSATED)
-        comp_result = [r for r in results if r[1] == 409][0]
-        assert (
-            comp_result[2]["error"]["code"] == "TUITION_ALREADY_PAID_COMPENSATED"
-        )
-        assert comp_result[2]["error"]["details"]["status"] == "COMPENSATED"
-
-        # 6. Kiểm tra trạng thái học phí của MSSV 52200001 và số dư của cả 2 tài khoản
-        tuition_after = client.get("/tuitions/52200001", headers=headers_a).json()
-        assert tuition_after["tuition_bill"]["status"] == "PAID"
-
-        acc_a_after = client.get("/accounts/me", headers=headers_a).json()
-        acc_b_after = client.get("/accounts/me", headers=headers_b).json()
-
-        print(
-            f"[✓] Số dư sau giao dịch:\n"
-            f"    - nguyenvana (Ban đầu 25,000,000): {acc_a_after['available_balance']:,.0f} VNĐ\n"
-            f"    - tranvanb   (Ban đầu 30,000,000): {acc_b_after['available_balance']:,.0f} VNĐ"
-        )
-
-        # Tổng số tiền bị trừ trên toàn hệ thống phải đúng bằng 1 lần học phí (14,500,000 VNĐ)
-        total_before = 25000000.0 + 30000000.0
-        total_after = acc_a_after["available_balance"] + acc_b_after["available_balance"]
-        assert total_before - total_after == 14500000.0, (
-            "Tổng số tiền trừ trên cả 2 tài khoản phải đúng bằng 1 lần học phí (14,500,000 VNĐ)!"
-        )
-        print(
-            "[✓] KẾT LUẬN CONCURRENCY 2: Khoản học phí MSSV 52200001 chỉ được thanh toán ĐÚNG 1 LẦN.\n"
-            "    Giao dịch đến sau đã được Saga Orchestrator hoàn tiền (COMPENSATION_REFUND) 100%!"
-        )
+        acc_a = client.get("/accounts/me", headers=headers_a).json()
+        acc_b = client.get("/accounts/me", headers=headers_b).json()
+        assert acc_a["available_balance"] + acc_b["available_balance"] == 55000000.0 - 15000000.0
+        print("[✓] 2.  User A thanh toán thành công -> MSSV = PAID; User B bị chặn 409, tổng tiền chỉ bị trừ 1 lần.")
 
 
 def test_concurrency_same_tuition():

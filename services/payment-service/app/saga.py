@@ -250,7 +250,7 @@ def call_generate_otp(
 ) -> Dict[str, Any]:
     url = f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/otp/generate"
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=25.0) as client:
             resp = client.post(
                 url, json=payload, headers=internal_headers(correlation_id)
             )
@@ -409,7 +409,7 @@ def call_send_receipt_email(
 ) -> Optional[Dict[str, Any]]:
     url = f"{settings.NOTIFICATION_OTP_SERVICE_URL}/internal/notifications/payment-receipt"
     try:
-        with httpx.Client(timeout=8.0) as client:
+        with httpx.Client(timeout=25.0) as client:
             resp = client.post(
                 url, json=payload, headers=internal_headers(correlation_id)
             )

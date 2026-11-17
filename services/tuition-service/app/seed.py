@@ -44,6 +44,22 @@ SEED_TUITIONS = [
         "amount": Decimal("14000000.00"),
         "status": "UNPAID",
     },
+    # === [CHỖ THÊM TÀI KHOẢN / EMAIL CỦA GIẢNG VIÊN KHI DEMO TRÊN LỚP] ===
+    # Nếu cần cho giảng viên tra cứu/đóng học phí, bỏ comment khối dưới, điền thông tin rồi gọi reset-demo.
+    # {
+    #     "student_id": "GV000001",
+    #     "full_name": "Họ và tên giảng viên",
+    #     "faculty": "Khoa Công nghệ Thông tin",
+    #     "major": "Kỹ thuật Phần mềm",
+    #     "class_code": "DEMO0001",
+    #     "email": "email.cua.giang.vien@tdtu.edu.vn",
+    #     "bill_id": uuid.UUID("22222222-2222-2222-2222-222222222299"),
+    #     "semester_code": "HK1_2026_2027",
+    #     "semester_name": "Học kỳ 1 - Năm học 2026-2027",
+    #     "amount": Decimal("10000000.00"),
+    #     "status": "UNPAID",
+    # },
+    # === [HẾT KHỐI THÊM TÀI KHOẢN GIẢNG VIÊN] ===
     {
         "student_id": "52200001",
         "full_name": "Trần Minh Khoa",
@@ -157,6 +173,7 @@ def seed_tuitions(db: Session, force_reset: bool = False) -> None:
                 else None,
                 paid_at=now if is_pre_paid else None,
                 version=1,
+                updated_at=now,
             )
             db.add(bill)
         elif force_reset:
